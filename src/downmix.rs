@@ -16,10 +16,11 @@
 //!   2/2, 3/2). `acmod = 0` (dual-mono 1+1) is handled by routing Ch1
 //!   into the Left output and Ch2 into the Right, which is the "Stereo"
 //!   dualmode path from §7.8.1.
-//! - **LFE:** always dropped. §7.8 allows any coefficient; adding LFE
-//!   to the stereo sum is risky (speakers crossed-over to a sub bus
-//!   will double-tap the bass) so we do what liba52 and ffmpeg's
-//!   `ac3_downmix` default both do and route LFE to nothing.
+//! - **LFE:** always dropped. §7.8 leaves the LFE downmix coefficient
+//!   implementation-defined; adding LFE to the stereo sum is risky
+//!   (speakers crossed-over to a sub bus will double-tap the bass), so
+//!   this decoder routes LFE to nothing — a spec-permitted default
+//!   matching the absence of LFE in mainstream stereo downmix output.
 //! - **Overload scaling:** §7.8.2 mandates attenuating the matrix so
 //!   `sum-of-coefficients ≤ 1`. We compute the per-output sum exactly
 //!   and divide — for stereo 3/2 this lands at the spec's 0.4143 worst
