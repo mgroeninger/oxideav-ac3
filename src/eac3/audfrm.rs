@@ -216,7 +216,7 @@ pub struct AudFrm {
 }
 
 impl AudFrm {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             expstre: true,
             ahte: false,

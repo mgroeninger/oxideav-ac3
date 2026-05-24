@@ -21,20 +21,27 @@
 //! blending, banded RMS scaling, coordinate scaling) runs in
 //! [`crate::audblk::dsp_block`] via `apply_spectral_extension`.
 //!
-//! ## Round 6 (this commit) — Adaptive Hybrid Transform (AHT)
+//! ## Adaptive Hybrid Transform (AHT) — multichannel fbw (round 110)
 //!
-//! Mono-only AHT decode. The audblk loop now keeps a per-channel
-//! AHT-coefficient cache (`aht_coeffs[ch][blk][bin]`) populated by
-//! [`unpack_mixed_mantissas`] on the FIRST AHT-active block per
-//! channel; subsequent blocks load coefficients from the cache and
-//! emit zero mantissa bits for that channel. The audfrm parser is
-//! split into phase A ([`super::audfrm::parse_with`]) + phase B
-//! ([`super::audfrm::parse_phase_b`]) so the dsp can hand it the
-//! pre-walked `nchregs[ch]` hints. For mono streams (`nfchans == 1`,
-//! no LFE, no coupling), `nchregs[0]` is implicitly `1` whenever
-//! `audfrm.ahte == 1`, so the dsp short-circuits the pre-walk.
-//! Multichannel / LFE / coupled AHT is round-7 work — those frames
-//! still mute via an `Unsupported` early return.
+//! Multichannel full-bandwidth AHT decode. The audblk loop keeps a
+//! per-channel AHT-coefficient cache (`aht_coeffs[ch][blk][bin]`)
+//! populated by [`unpack_mixed_mantissas`] on the FIRST AHT-active block
+//! per channel; subsequent blocks load coefficients from the cache and
+//! emit zero mantissa bits for that channel. The audfrm parser is split
+//! into phase A ([`super::audfrm::parse_with`]) + phase B
+//! ([`super::audfrm::parse_phase_b`]) so the dsp can hand it the §3.4.2
+//! helper variables `nchregs[ch]` / `ncplregs` / `nlferegs`. Round 6
+//! shipped mono-only by hardcoding `nchregs[0] = 1`; round 110 computes
+//! all three regs directly from the already-parsed per-block exponent
+//! strategies ([`compute_aht_regs`]) — no real audblk pre-walk needed —
+//! so every fbw channel with `nchregs[ch] == 1` takes the AHT path.
+//! The non-AHT (standard scalar) channels in a mixed frame now share
+//! the bap-1/2/4 grouping buffers across channels in frequency-then-
+//! channel order via the canonical [`crate::audblk::fetch_mantissa`],
+//! matching base AC-3 §7.3.5 (round 6's per-channel grouping was correct
+//! only for the mono case). Coupling-AHT (`cplahtinu`) and LFE-AHT
+//! (`lfeahtinu`) synthesis remain deferred: such frames are rejected as
+//! `Unsupported` after the regs-driven phase-B parse confirms the flag.
 //!
 //! Per-bin AHT decode flow:
 //!
@@ -232,38 +239,32 @@ pub fn decode_indep_audblks(
     state: &mut Ac3State,
     out: &mut [f32],
 ) -> Result<()> {
-    // Phase-B audfrm finalisation when AHT is in use. The audfrm
-    // parser stopped at the AHT anchor so the dsp can compute
-    // nchregs[ch]/ncplregs/nlferegs from per-block exponent
-    // strategies. For round 6 we restrict AHT support to **mono
-    // streams with no LFE and no coupling** — the only configuration
-    // exercised by the corpus's `eac3-low-bitrate-32kbps` fixture
-    // (1 fbw channel, lfeon=0, ncplblks=0). In that case the AHT bit
-    // count is fixed at 1 (chahtinu[0]) IFF `ahte == 1`, since the
-    // spec mandates that ahte can only be set when at least one
-    // chahtinu/cplahtinu/lfeahtinu emit a `1` — and the only candidate
-    // is chahtinu[0]. Multichannel / LFE / coupling AHT requires the
-    // 2-pass nchregs probe described in §3.4.2 and lands in round 7.
+    // Phase-B audfrm finalisation when AHT is in use. The audfrm parser
+    // stopped at the AHT anchor so the dsp can compute the §3.4.2 helper
+    // variables `nchregs[ch]` / `ncplregs` / `nlferegs` — the number of
+    // times each channel transmits exponents in the 6-block frame. These
+    // are NOT in the bitstream; they are derived from the per-block
+    // exponent strategies that audfrm already parsed (`chexpstr_blk_ch`,
+    // `cplexpstr_blk` + `cplstre_blk`, `lfeexpstr`), so no real audblk
+    // pre-walk is needed — every input is available on `AudFrm`.
+    //
+    // `parse_phase_b` then reads `chahtinu[ch]` for every fbw channel
+    // with `nchregs[ch] == 1` (multichannel-capable as of round 110),
+    // plus `cplahtinu` / `lfeahtinu` when their regs gate fires.
+    // Coupling-AHT and LFE-AHT synthesis are still deferred, so after
+    // parsing we reject only the frames that actually carry one of
+    // those flags set — multichannel fbw AHT now decodes.
     let mut audfrm_local;
     let audfrm: &AudFrm = if audfrm.aht_phase_b_pending {
-        if !(bsi.nfchans == 1 && !bsi.lfeon && audfrm.ncplblks == 0) {
+        audfrm_local = audfrm.clone();
+        let hints = compute_aht_regs(&audfrm_local, bsi);
+        audfrm::parse_phase_b(br, &mut audfrm_local, bsi, &hints)?;
+        if audfrm_local.cplahtinu || audfrm_local.lfeahtinu {
             return Err(Error::unsupported(
-                "eac3 dsp: AHT in use on multichannel / lfe / coupled stream — \
-                 round 6 implements mono-only AHT (single chahtinu[0] bit). \
-                 nchregs probe for the multichannel case is round-7 work.",
+                "eac3 dsp: coupling-AHT / LFE-AHT in use (cplahtinu / lfeahtinu) — \
+                 multichannel fbw AHT decodes; coupled / LFE AHT synthesis deferred.",
             ));
         }
-        audfrm_local = audfrm.clone();
-        let hints = AhtRegsHints {
-            nchregs: {
-                let mut h = [0u8; MAX_FBW];
-                h[0] = 1; // mono-only: chahtinu[0] presence implies nchregs[0]==1.
-                h
-            },
-            ncplregs: 0,
-            nlferegs: 0,
-        };
-        audfrm::parse_phase_b(br, &mut audfrm_local, bsi, &hints)?;
         &audfrm_local
     } else {
         audfrm
@@ -1329,7 +1330,16 @@ fn apply_transient_prenoise(
 /// `aht_coeffs[ch][blk][bin]` for the per-block dispatch loop above.
 ///
 /// Coupling/LFE AHT (`cplahtinu`/`lfeahtinu`) is **not** handled here —
-/// the round-6 dispatch only sets `aht_pending[ch]` for fbw channels.
+/// the dispatch only sets `aht_pending[ch]` for fbw channels.
+///
+/// Multichannel note (round 110): the non-AHT (standard scalar) channels
+/// share the bap-1/2/4 triplet/pair grouping buffers across channels in
+/// frequency-then-channel order, exactly as the base AC-3
+/// [`audblk::unpack_mantissas`] does — a started bap=1 group is consumed
+/// by the next bap=1 mantissa even if it belongs to a later channel.
+/// AHT channels read their mantissas in a separate front-loaded block, so
+/// they never touch these shared buffers; the grouping threads only
+/// across the standard channels present in this audblk's mantissa stream.
 fn unpack_mixed_mantissas(
     state: &mut Ac3State,
     _bsi: &Ac3Bsi,
@@ -1349,6 +1359,18 @@ fn unpack_mixed_mantissas(
         }
     }
 
+    // Shared bap-1/2/4 grouping buffers, threaded across every standard
+    // (non-AHT) channel in this audblk — see the function docstring.
+    // Declared once outside the channel loop so a triplet/pair started by
+    // one channel is consumed by the next channel that needs it, matching
+    // base AC-3 [`audblk::unpack_mantissas`].
+    let mut grp1: [f32; 3] = [0.0; 3];
+    let mut grp1_n = 0usize;
+    let mut grp2: [f32; 3] = [0.0; 3];
+    let mut grp2_n = 0usize;
+    let mut grp4: [f32; 2] = [0.0; 2];
+    let mut grp4_n = 0usize;
+
     // Standard channels (and the AHT-skip blocks for AHT channels)
     // pull from the bit stream; AHT channels on their FIRST appearance
     // pull the mantissa block and IDCT it. We walk channels in order
@@ -1366,117 +1388,39 @@ fn unpack_mixed_mantissas(
         if aht_pending[ch] {
             // First AHT-active block for this channel — read GAQ side
             // info + 6×nmant mantissas + IDCT into the coefficient
-            // cache.
+            // cache. AHT reads a self-contained VQ/GAQ codeword stream
+            // and never touches the shared grouping buffers above.
             decode_aht_channel_mantissas(state, ch, end, br, &mut aht_coeffs[ch])?;
             aht_filled[ch] = true;
             aht_pending[ch] = false;
             continue;
         }
-        // Standard scalar mantissa path. Walks this channel inline
-        // using the same fetch shape as `audblk::unpack_mantissas`
-        // (single-channel grouping state — multichannel sharing of
-        // bap-1/2/4 triplet/pair buffers is round-7 work).
-        unpack_one_channel_scalar(state, ch, end, br)?;
-    }
-    Ok(())
-}
-
-/// Walk one channel's scalar mantissa path (standard, non-AHT). This
-/// mirrors the per-channel inner loop of [`audblk::unpack_mantissas`]
-/// without the cross-channel grouping state — for round-6 AHT the
-/// only "mixed" use-case is mono (1 fbw channel + AHT in use), so
-/// the bap-1/2/4 cross-channel triplet/pair sharing isn't reachable.
-/// For multichannel AHT (round 7) the grouping state must be threaded
-/// across channels.
-fn unpack_one_channel_scalar(
-    state: &mut Ac3State,
-    ch: usize,
-    end: usize,
-    br: &mut BitReader<'_>,
-) -> Result<()> {
-    use crate::tables::QUANTIZATION_BITS;
-    // Per-channel ephemeral grouping state; safe for the mono case.
-    let mut grp1 = [0.0f32; 3];
-    let mut grp1_n = 0usize;
-    let mut grp2 = [0.0f32; 3];
-    let mut grp2_n = 0usize;
-    let mut grp4 = [0.0f32; 2];
-    let mut grp4_n = 0usize;
-    let dith = state.channels[ch].dithflag;
-    for bin in 0..end {
-        let bap = state.channels[ch].bap[bin];
-        let v = match bap {
-            0 => 0.0f32,
-            1 => {
-                if grp1_n == 0 {
-                    let code = br.read_u32(5)? as i32;
-                    let m1 = code / 9;
-                    let m2 = (code % 9) / 3;
-                    let m3 = code % 3;
-                    let lvl = crate::tables::MANT_LEVEL_3;
-                    grp1 = [
-                        lvl[m1.clamp(0, 2) as usize],
-                        lvl[m2.clamp(0, 2) as usize],
-                        lvl[m3.clamp(0, 2) as usize],
-                    ];
-                    grp1_n = 3;
-                }
-                let r = grp1[3 - grp1_n];
-                grp1_n -= 1;
-                r
-            }
-            2 => {
-                if grp2_n == 0 {
-                    let code = br.read_u32(7)? as i32;
-                    let m1 = code / 25;
-                    let m2 = (code % 25) / 5;
-                    let m3 = code % 5;
-                    let lvl = crate::tables::MANT_LEVEL_5;
-                    grp2 = [
-                        lvl[m1.clamp(0, 4) as usize],
-                        lvl[m2.clamp(0, 4) as usize],
-                        lvl[m3.clamp(0, 4) as usize],
-                    ];
-                    grp2_n = 3;
-                }
-                let r = grp2[3 - grp2_n];
-                grp2_n -= 1;
-                r
-            }
-            3 => {
-                let code = br.read_u32(3)? as usize;
-                crate::tables::MANT_LEVEL_7[code.min(6)]
-            }
-            4 => {
-                if grp4_n == 0 {
-                    let code = br.read_u32(7)? as i32;
-                    let m1 = code / 11;
-                    let m2 = code % 11;
-                    let lvl = crate::tables::MANT_LEVEL_11;
-                    grp4 = [lvl[m1.clamp(0, 10) as usize], lvl[m2.clamp(0, 10) as usize]];
-                    grp4_n = 2;
-                }
-                let r = grp4[2 - grp4_n];
-                grp4_n -= 1;
-                r
-            }
-            5 => {
-                let code = br.read_u32(4)? as usize;
-                crate::tables::MANT_LEVEL_15[code.min(14)]
-            }
-            b if (6..=15).contains(&b) => {
-                let nbits = QUANTIZATION_BITS[b as usize] as u32;
-                let raw = br.read_u32(nbits)? as i32;
-                let shift = 32 - nbits;
-                let signed = (raw << shift) >> shift;
-                let scale = 2f32.powi(-(nbits as i32 - 1));
-                signed as f32 * scale
-            }
-            _ => 0.0,
-        };
-        let final_v = if bap == 0 && dith { 0.0 } else { v };
-        let e = state.channels[ch].exp[bin] as i32;
-        state.channels[ch].coeffs[bin] = final_v * 2f32.powi(-e);
+        // Standard scalar mantissa path — uses the canonical base-AC-3
+        // `fetch_mantissa` so bap-1/2/4 grouping shares the buffers above
+        // across all standard channels (§7.3.5) and bap=0 dither matches
+        // the base path's LFSR (§7.3.4).
+        let dith = state.channels[ch].dithflag;
+        for bin in 0..end {
+            let bap = state.channels[ch].bap[bin];
+            let val = audblk::fetch_mantissa(
+                br,
+                bap,
+                &mut grp1,
+                &mut grp1_n,
+                &mut grp2,
+                &mut grp2_n,
+                &mut grp4,
+                &mut grp4_n,
+                false,
+            )?;
+            let final_val = if bap == 0 && dith {
+                audblk::dither_lfsr(&mut state.dither_lfsr_state)
+            } else {
+                val
+            };
+            let e = state.channels[ch].exp[bin] as i32;
+            state.channels[ch].coeffs[bin] = final_val * 2f32.powi(-e);
+        }
     }
     Ok(())
 }
@@ -1586,6 +1530,64 @@ fn decode_aht_channel_mantissas(
     }
 
     Ok(())
+}
+
+/// Compute the §3.4.2 AHT helper variables `nchregs[ch]` / `ncplregs` /
+/// `nlferegs` from the per-block exponent strategies already parsed onto
+/// `AudFrm`. Each variable counts the number of audio blocks in the
+/// 6-block frame that transmit fresh exponents for that channel (i.e. a
+/// strategy other than REUSE); coupling additionally counts blocks that
+/// re-declare the coupling strategy (`cplstre[blk] == 1`).
+///
+/// These are NOT in the bitstream — the spec derives them so the decoder
+/// knows which `chahtinu` / `cplahtinu` / `lfeahtinu` presence bits the
+/// `audfrm()` AHT block actually emitted (a flag is only present when its
+/// regs count is exactly 1, meaning exponents are sent once per frame and
+/// the channel is AHT-eligible). All inputs (`chexpstr_blk_ch`,
+/// `cplexpstr_blk`, `cplstre_blk`, `lfeexpstr`) are filled by
+/// `audfrm::parse_with` for both the `expstre == 1` and `expstre == 0`
+/// (Table E2.10) paths, so no real audblk pre-walk is required.
+fn compute_aht_regs(audfrm: &AudFrm, bsi: &Eac3Bsi) -> AhtRegsHints {
+    const REUSE: u8 = 0;
+    let nfchans = (bsi.nfchans as usize).min(MAX_FBW);
+
+    // nchregs[ch] — §3.4.2: count blocks where chexpstr[blk][ch] != reuse.
+    let mut nchregs = [0u8; MAX_FBW];
+    for (ch, regs) in nchregs.iter_mut().enumerate().take(nfchans) {
+        let mut n = 0u8;
+        for blk in 0..AHT_BLOCKS {
+            if audfrm.chexpstr_blk_ch[blk][ch] != REUSE {
+                n += 1;
+            }
+        }
+        *regs = n;
+    }
+
+    // ncplregs — §3.4.2: only meaningful when coupling is in use for all
+    // 6 blocks (the AHT eligibility gate also checks `ncplblks == 6`).
+    // Count blocks where cplstre[blk] == 1 OR cplexpstr[blk] != reuse.
+    let mut ncplregs = 0u8;
+    for blk in 0..AHT_BLOCKS {
+        if audfrm.cplstre_blk[blk] || audfrm.cplexpstr_blk[blk] != REUSE {
+            ncplregs += 1;
+        }
+    }
+
+    // nlferegs — §3.4.2: count blocks where lfeexpstr[blk] != reuse.
+    let mut nlferegs = 0u8;
+    if bsi.lfeon {
+        for blk in 0..AHT_BLOCKS {
+            if audfrm.lfeexpstr[blk] != REUSE {
+                nlferegs += 1;
+            }
+        }
+    }
+
+    AhtRegsHints {
+        nchregs,
+        ncplregs,
+        nlferegs,
+    }
 }
 
 /// Decide whether the round-2 DSP path can handle this frame.
@@ -1799,5 +1801,109 @@ mod tpnp_tests {
             orig[transloc + 5],
             "post-transient untouched"
         );
+    }
+}
+
+#[cfg(test)]
+mod aht_regs_tests {
+    use super::*;
+
+    /// Build a minimal Annex-E BSI for the regs tests. `acmod` drives
+    /// `nfchans`; `lfeon` toggles the LFE; `num_blocks` is fixed at 6
+    /// because AHT is only available in 6-block mode (§3.4.2).
+    fn bsi(acmod: u8, lfeon: bool) -> Eac3Bsi {
+        let nfchans = crate::tables::acmod_nfchans(acmod);
+        Eac3Bsi {
+            strmtyp: StreamType::Independent,
+            substreamid: 0,
+            frmsiz: 383,
+            fscod: 0,
+            fscod2: 0xFF,
+            sample_rate: 48_000,
+            numblkscod: 3,
+            num_blocks: 6,
+            acmod,
+            nfchans,
+            lfeon,
+            nchans: nfchans + u8::from(lfeon),
+            bsid: 16,
+            dialnorm: 27,
+            chanmap: None,
+            frame_bytes: 768,
+            bits_consumed: 0,
+        }
+    }
+
+    /// REUSE = 0; D15 = 1 etc. nchregs[ch] counts the non-REUSE blocks.
+    #[test]
+    fn nchregs_counts_non_reuse_blocks_per_channel() {
+        let b = bsi(2, false); // 2/0 stereo, 2 fbw channels.
+        let mut af = AudFrm::new();
+        // Channel 0: AHT-eligible — block 0 fresh (D15), blocks 1..5 REUSE.
+        af.chexpstr_blk_ch[0][0] = 1;
+        // Channel 1: NOT AHT-eligible — fresh on block 0 and block 3.
+        af.chexpstr_blk_ch[0][1] = 2;
+        af.chexpstr_blk_ch[3][1] = 1;
+
+        let regs = compute_aht_regs(&af, &b);
+        assert_eq!(regs.nchregs[0], 1, "ch0 sends exponents once → eligible");
+        assert_eq!(
+            regs.nchregs[1], 2,
+            "ch1 sends exponents twice → not eligible"
+        );
+        // Channels beyond nfchans must stay zero.
+        assert_eq!(regs.nchregs[2], 0);
+        assert_eq!(regs.ncplregs, 0, "no coupling strategy set → 0");
+        assert_eq!(regs.nlferegs, 0, "lfeon=false → 0");
+    }
+
+    /// ncplregs counts blocks with `cplstre[blk] == 1` OR a non-REUSE
+    /// coupling exponent strategy (§3.4.2 first pseudo-code block).
+    #[test]
+    fn ncplregs_counts_cplstre_or_non_reuse_cplexpstr() {
+        let b = bsi(7, false); // 3/2, coupling-capable.
+        let mut af = AudFrm::new();
+        // Block 0: cplstre set (always true for block 0 when coupling
+        // is in use) → counts. Block 2: fresh cplexpstr only. Block 4:
+        // both. Others REUSE / no strategy.
+        af.cplstre_blk[0] = true;
+        af.cplexpstr_blk[2] = 2; // D25, non-REUSE → counts
+        af.cplstre_blk[4] = true;
+        af.cplexpstr_blk[4] = 1; // counted once (single block)
+
+        let regs = compute_aht_regs(&af, &b);
+        assert_eq!(
+            regs.ncplregs, 3,
+            "blocks 0, 2, 4 transmit coupling exponents"
+        );
+    }
+
+    /// nlferegs counts non-REUSE LFE exponent strategy blocks, and is
+    /// only computed when `lfeon` is set.
+    #[test]
+    fn nlferegs_counts_non_reuse_lfe_blocks() {
+        let mut af = AudFrm::new();
+        af.lfeexpstr[0] = 1; // D15 fresh
+        af.lfeexpstr[3] = 1; // D15 fresh
+
+        // lfeon=false → always 0 regardless of lfeexpstr contents.
+        let no_lfe = compute_aht_regs(&af, &bsi(7, false));
+        assert_eq!(no_lfe.nlferegs, 0, "lfeon=false suppresses nlferegs");
+
+        // lfeon=true → counts the two non-REUSE blocks.
+        let with_lfe = compute_aht_regs(&af, &bsi(7, true));
+        assert_eq!(with_lfe.nlferegs, 2, "two fresh LFE strategy blocks");
+    }
+
+    /// A channel that transmits exponents only once across the frame is
+    /// AHT-eligible (`nchregs == 1`); a single fresh block 0 with all
+    /// reuse afterwards is the canonical eligible pattern.
+    #[test]
+    fn single_fresh_block_zero_is_aht_eligible() {
+        let b = bsi(1, false); // mono
+        let mut af = AudFrm::new();
+        af.chexpstr_blk_ch[0][0] = 3; // D45 fresh, rest REUSE
+        let regs = compute_aht_regs(&af, &b);
+        assert_eq!(regs.nchregs[0], 1);
     }
 }

@@ -1499,7 +1499,7 @@ fn calc_lowcomp(a: i32, b0: i32, b1: i32, bin: usize) -> i32 {
 /// because it has a maximal 65535-sample period and the output looks
 /// like white noise to within a few bits. Seed is arbitrary but
 /// fixed so decodes are deterministic.
-fn dither_lfsr(state: &mut u32) -> f32 {
+pub(crate) fn dither_lfsr(state: &mut u32) -> f32 {
     // Advance the 16-bit LFSR one step and return a uniform value in
     // the range `[-0.707, 0.707)` — the spec's "optimum" scaling
     // (0.707 ≈ 1/√2). Uses the classic Fibonacci taps at bits
@@ -1661,7 +1661,7 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fetch_mantissa(
+pub(crate) fn fetch_mantissa(
     br: &mut BitReader,
     bap: u8,
     g1: &mut [f32; 3],

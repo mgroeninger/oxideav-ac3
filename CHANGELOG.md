@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 multichannel full-bandwidth AHT decode** — round 110. Extends
+  the round-6 mono-only Adaptive Hybrid Transform path to any number of
+  fbw channels. The §3.4.2 helper variables `nchregs[ch]` / `ncplregs` /
+  `nlferegs` are now computed (`eac3::dsp::compute_aht_regs`) directly
+  from the per-block exponent strategies already parsed onto `AudFrm`
+  (`chexpstr_blk_ch`, `cplexpstr_blk` + `cplstre_blk`, `lfeexpstr`) — the
+  spec derives these from the bitstream rather than transmitting them, and
+  every input is available before the AHT anchor, so no real audblk
+  pre-walk is needed. `parse_phase_b` then reads `chahtinu[ch]` for every
+  fbw channel whose `nchregs[ch] == 1` (the AHT-eligibility gate: exponents
+  sent exactly once per 6-block frame). The previous hardcoded mono path
+  (`nfchans == 1 && !lfeon && ncplblks == 0`, single `nchregs[0] = 1` hint)
+  is gone.
+  * **Cross-channel mantissa grouping fix**: the standard (non-AHT)
+    channels in a mixed frame now share the bap-1/2/4 triplet/pair
+    grouping buffers across channels in frequency-then-channel order via
+    the canonical `audblk::fetch_mantissa`, matching base AC-3 §7.3.5.
+    Round 6's `unpack_one_channel_scalar` used per-channel grouping state
+    that was only correct for the single-channel case; it is removed. The
+    bap=0 dither now also uses the base path's §7.3.4 LFSR (the round-6
+    scalar path zeroed dithered bins). The mono AHT fixture never reached
+    the scalar path (its only channel takes the AHT branch), so this
+    change has no effect on the previously-passing case.
+  * **Coupling-AHT (`cplahtinu`) and LFE-AHT (`lfeahtinu`)** synthesis
+    remain deferred: such frames are rejected as `Unsupported` after the
+    regs-driven phase-B parse confirms the flag is set, instead of the
+    old blanket multichannel reject. Multichannel fbw AHT now decodes.
+  * 4 unit tests (`eac3::dsp::aht_regs_tests`) cover the nchregs /
+    ncplregs / nlferegs counting rules and the `nchregs == 1`
+    eligibility pattern.
+
 - **E-AC-3 transient pre-noise processing (TPNP) decode** — round 103.
   Implements the §E.3.7.2 PCM-domain time-scaling synthesis, replacing
   the round-2 whole-frame reject (`transproce == 1` previously errored
