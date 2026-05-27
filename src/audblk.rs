@@ -166,6 +166,17 @@ pub struct ChannelState {
     /// (and hence a new `spxblnd`) arrive; reused otherwise.
     pub spx_nblend: [f32; 18],
     pub spx_sblend: [f32; 18],
+    /// E-AC-3 spectral-extension attenuation (§3.6.4.2.3, §2.3.2.24-25).
+    /// `spx_atten_active` mirrors the frame-level `chinspxatten[ch]` bit
+    /// (a frame-scoped flag — the spec carries it in audfrm, not audblk,
+    /// so it stays constant across the 6 blocks of a syncframe). When
+    /// set, the SPX synthesis applies a 5-tap notch filter at the
+    /// baseband/extension border (and at every wrap point during the
+    /// translation copy) using row `spx_atten_code` of Table E3.14.
+    pub spx_atten_active: bool,
+    /// `spxattencod[ch]` — 5-bit index into Table E3.14
+    /// (`SPX_ATTEN_TABLE`). Only meaningful when `spx_atten_active`.
+    pub spx_atten_code: u8,
 }
 
 impl Default for ChannelState {
@@ -194,6 +205,8 @@ impl ChannelState {
             spx_coord: [0.0; 18],
             spx_nblend: [0.0; 18],
             spx_sblend: [0.0; 18],
+            spx_atten_active: false,
+            spx_atten_code: 0,
         }
     }
 }
@@ -1754,6 +1767,72 @@ fn spx_bandtable(subbnd: usize) -> usize {
     25 + 12 * subbnd
 }
 
+/// Table E3.14 — Spectral Extension Attenuation Table `spxattentab[][]`
+/// (§3.6.4.2.3). Indexed by the 5-bit `spxattencod[ch]` codeword
+/// (rows 0..=31), each row holds the first 3 attenuation values of a
+/// 5-tap symmetric notch filter applied at the baseband / extension
+/// border (and at every wrap point during the §3.6.4.1 translation
+/// copy). The 5-tap kernel is `[T[0], T[1], T[2], T[1], T[0]]` —
+/// the last two taps are derived by symmetry per spec text:
+///
+/// > "The first 3 attenuation values of the filter are determined by
+/// > lookup into Table E3.14 with index `spxattencod[ch]`. The last
+/// > two attenuation values of the filter are determined by symmetry
+/// > and are not explicitly stored in the table."
+#[allow(clippy::excessive_precision)] // spec text values; f32 round suffices
+pub(crate) const SPX_ATTEN_TABLE: [[f32; 3]; 32] = [
+    [0.954_841_604, 0.911_722_489, 0.870_550_563],
+    [0.911_722_489, 0.831_237_896, 0.757_858_283],
+    [0.870_550_563, 0.757_858_283, 0.659_753_955],
+    [0.831_237_896, 0.690_956_440, 0.574_349_177],
+    [0.793_700_526, 0.629_960_525, 0.500_000_000],
+    [0.757_858_283, 0.574_349_177, 0.435_275_282],
+    [0.723_634_619, 0.523_647_061, 0.378_929_142],
+    [0.690_956_440, 0.477_420_802, 0.329_876_978],
+    [0.659_753_955, 0.435_275_282, 0.287_174_589],
+    [0.629_960_525, 0.396_850_263, 0.250_000_000],
+    [0.601_512_518, 0.361_817_309, 0.217_637_641],
+    [0.574_349_177, 0.329_876_978, 0.189_464_571],
+    [0.548_412_490, 0.300_756_259, 0.164_938_489],
+    [0.523_647_061, 0.274_206_245, 0.143_587_294],
+    [0.500_000_000, 0.250_000_000, 0.125_000_000],
+    [0.477_420_802, 0.227_930_622, 0.108_818_820],
+    [0.455_861_244, 0.207_809_474, 0.094_732_285],
+    [0.435_275_282, 0.189_464_571, 0.082_469_244],
+    [0.415_618_948, 0.172_739_110, 0.071_793_647],
+    [0.396_850_263, 0.157_490_131, 0.062_500_000],
+    [0.378_929_142, 0.143_587_294, 0.054_409_410],
+    [0.361_817_309, 0.130_911_765, 0.047_366_143],
+    [0.345_478_220, 0.119_355_200, 0.041_234_622],
+    [0.329_876_978, 0.108_818_820, 0.035_896_824],
+    [0.314_980_262, 0.099_212_566, 0.031_250_000],
+    [0.300_756_259, 0.090_454_327, 0.027_204_705],
+    [0.287_174_589, 0.082_469_244, 0.023_683_071],
+    [0.274_206_245, 0.075_189_065, 0.020_617_311],
+    [0.261_823_531, 0.068_551_561, 0.017_948_412],
+    [0.250_000_000, 0.062_500_000, 0.015_625_000],
+    [0.238_710_401, 0.056_982_656, 0.013_602_353],
+    [0.227_930_622, 0.051_952_369, 0.011_841_536],
+];
+
+/// Apply the §3.6.4.2.3 5-tap symmetric notch filter to a 5-bin window
+/// centred on the band-border bin. The kernel taps are
+/// `[T[0], T[1], T[2], T[1], T[0]]` where `T = SPX_ATTEN_TABLE[code]`.
+/// The window starts at `filtbin` (which the caller positions at
+/// `border_bin - 2`); bins outside `0..N_COEFFS` are skipped so this is
+/// safe near the array tail.
+#[inline]
+fn apply_spx_atten_notch(coeffs: &mut [f32; N_COEFFS], filtbin: usize, code: u8) {
+    let row = SPX_ATTEN_TABLE[(code & 0x1F) as usize];
+    let taps = [row[0], row[1], row[2], row[1], row[0]];
+    for (i, tap) in taps.iter().enumerate() {
+        let idx = filtbin + i;
+        if idx < N_COEFFS {
+            coeffs[idx] *= *tap;
+        }
+    }
+}
+
 /// One step of the SPX pseudo-random noise generator (§E.3.6.4.2). The
 /// spec only requires a "zero-mean, unity-variance" sequence and leaves
 /// the exact generator non-normative — AC-3 / E-AC-3 are lossy and the
@@ -1814,22 +1893,68 @@ fn apply_spectral_extension(state: &mut Ac3State, nfchans: usize) {
         }
 
         // 1. Transform coefficient translation (§E.3.6.4.1).
+        //    `wrapflag[bnd]` is true when the band-relative copy cursor
+        //    had to wrap back to `copystart` before consuming this
+        //    band's `bandsize` samples — i.e. the band straddles a copy
+        //    boundary. The spec applies the §3.6.4.2.3 border notch
+        //    filter at every such wrap point AND at the baseband /
+        //    extension border itself (the bin straddling `spx_begin_tc`).
         let mut copyindex = copystart;
         let mut insertindex = spx_begin_tc;
+        let mut wrapflag = [false; 18];
         for bnd in 0..nbnds {
             let bandsize = state.spx_bndsztab[bnd];
+            // Spec pseudocode applies wrap detection at TWO points: the
+            // pre-band check `(copyindex + bandsize > copyend)` AND the
+            // per-bin `(copyindex == copyend)` check. Either path is a
+            // wrap from the band's point of view. Band 0 is the
+            // baseband/extension border itself — its filter site is
+            // emitted unconditionally outside this loop, so only
+            // bnd >= 1 wraps need flagging.
+            let mut wrapped = false;
             if copyindex + bandsize > copyend {
                 copyindex = copystart;
+                wrapped = true;
             }
             for _ in 0..bandsize {
                 if copyindex == copyend {
                     copyindex = copystart;
+                    wrapped = true;
                 }
                 if insertindex < N_COEFFS && copyindex < N_COEFFS {
                     state.channels[ch].coeffs[insertindex] = state.channels[ch].coeffs[copyindex];
                 }
                 insertindex += 1;
                 copyindex += 1;
+            }
+            if bnd > 0 && wrapped {
+                wrapflag[bnd] = true;
+            }
+        }
+
+        // 1b. §3.6.4.2.3 Transform Coefficient Band Border Filtering —
+        //     after the §3.6.4.1 translation copy AND BEFORE the
+        //     §3.6.4.2.2 banded RMS / §3.6.4.2.4 noise scaling. The
+        //     5-tap symmetric notch filter sits centred on the first
+        //     extension bin, attenuating the 2 bins below and 2 bins
+        //     above the border (filter starts at `spx_begin_tc - 2`).
+        //     The same filter re-applies at each band-internal wrap
+        //     point flagged above (filter starts at the band's start
+        //     minus 2 bins).
+        if state.channels[ch].spx_atten_active {
+            let code = state.channels[ch].spx_atten_code;
+            // Baseband / extension region border.
+            let border = spx_begin_tc;
+            if border >= 2 {
+                apply_spx_atten_notch(&mut state.channels[ch].coeffs, border - 2, code);
+            }
+            // Wrap points at band starts (bnd >= 1).
+            let mut band_start = spx_begin_tc;
+            for bnd in 0..nbnds {
+                if bnd > 0 && wrapflag[bnd] && band_start >= 2 {
+                    apply_spx_atten_notch(&mut state.channels[ch].coeffs, band_start - 2, code);
+                }
+                band_start += state.spx_bndsztab[bnd];
             }
         }
 
@@ -2365,5 +2490,229 @@ mod spx_tests {
         state.spx_in_use = false;
         apply_spectral_extension(&mut state, 1);
         assert!((49..73).all(|b| state.channels[0].coeffs[b] == 0.0));
+    }
+
+    /// Spot-check three rows of Table E3.14 against the spec values. The
+    /// scaling rows (0, 14, 29) cover the table's value-doubling
+    /// progression (each ~2× step in `binindex=0` halves at the next
+    /// power-of-two row) so a transcription typo on any of them stands
+    /// out immediately.
+    #[test]
+    fn spx_atten_table_matches_spec() {
+        // Compare against the spec's full 9-decimal-digit values held in
+        // f64 (f32 literals would clip and trip `excessive_precision`).
+        // f32 precision is ~7 digits so we compare within 1e-6 absolute.
+        let check = |row: usize, col: usize, spec: f64| {
+            let got = SPX_ATTEN_TABLE[row][col] as f64;
+            assert!(
+                (got - spec).abs() < 1e-6,
+                "row {row} col {col}: got {got}, spec {spec}",
+            );
+        };
+        // Row 0.
+        check(0, 0, 0.954_841_604);
+        check(0, 1, 0.911_722_489);
+        check(0, 2, 0.870_550_563);
+        // Row 14 (half-attenuation reference: T[0]=0.5).
+        check(14, 0, 0.5);
+        check(14, 1, 0.25);
+        check(14, 2, 0.125);
+        // Row 29 (quarter-attenuation reference: T[0]=0.25).
+        check(29, 0, 0.25);
+        check(29, 1, 0.0625);
+        check(29, 2, 0.015_625);
+        // 32 rows total per the 5-bit `spxattencod[ch]` field.
+        assert_eq!(SPX_ATTEN_TABLE.len(), 32);
+    }
+
+    /// `apply_spx_atten_notch` is the 5-tap symmetric filter
+    /// `[T[0], T[1], T[2], T[1], T[0]]`. Drive it on a constant-1 buffer
+    /// and read back the filtered bins — they must equal the kernel.
+    #[test]
+    fn spx_atten_notch_kernel_is_symmetric() {
+        let mut coeffs = [0.0f32; N_COEFFS];
+        for v in coeffs.iter_mut().take(50) {
+            *v = 1.0;
+        }
+        // Apply at filtbin=10 with code=14 (T = [0.5, 0.25, 0.125]).
+        apply_spx_atten_notch(&mut coeffs, 10, 14);
+        assert!((coeffs[10] - 0.5).abs() < 1e-6);
+        assert!((coeffs[11] - 0.25).abs() < 1e-6);
+        assert!((coeffs[12] - 0.125).abs() < 1e-6);
+        assert!((coeffs[13] - 0.25).abs() < 1e-6); // mirror
+        assert!((coeffs[14] - 0.5).abs() < 1e-6); // mirror
+                                                  // Outside the 5-tap window, coefficients are untouched.
+        assert_eq!(coeffs[9], 1.0);
+        assert_eq!(coeffs[15], 1.0);
+    }
+
+    /// `apply_spx_atten_notch` masks the 5-bit code so a malformed
+    /// 6-or-7-bit value doesn't index out of bounds.
+    #[test]
+    fn spx_atten_notch_masks_code_to_5_bits() {
+        let mut coeffs = [1.0f32; N_COEFFS];
+        // 0x3F & 0x1F == 31 → row 31. Should not panic.
+        apply_spx_atten_notch(&mut coeffs, 0, 0x3F);
+        assert!((coeffs[0] - SPX_ATTEN_TABLE[31][0]).abs() < 1e-6);
+    }
+
+    /// With `spx_atten_active == true` and `spxattencod = 14` (the
+    /// half-attenuation row), the 5 bins centred on the baseband /
+    /// extension border (i.e. starting at `spx_begin_tc - 2`) must
+    /// be attenuated by `[0.5, 0.25, 0.125, 0.25, 0.5]` AFTER the
+    /// translation copy and BEFORE the noise/coord blend. We isolate
+    /// the filter contribution by setting blend factors to a pure-pass
+    /// (sblend=1, nblend=0, coord=1/32).
+    #[test]
+    fn spx_synthesis_applies_border_notch_when_chinspxatten() {
+        let mut state = Ac3State::new();
+        let ch = 0usize;
+        state.spx_in_use = true;
+        state.channels[ch].in_spx = true;
+        state.spx_strtf = 0; // copystart = 25
+        state.spx_begin_subbnd = 2; // copyend / spx_begin = 49
+        state.spx_end_subbnd = 4; // spx_end = 73
+        state.spx_bndstrc = [false; 18];
+        state.spx_bndstrc[3] = true;
+        state.spx_nbnds = 1;
+        state.spx_bndsztab = [0; 18];
+        state.spx_bndsztab[0] = 24;
+        state.channels[ch].spx_sblend[0] = 1.0;
+        state.channels[ch].spx_nblend[0] = 0.0;
+        state.channels[ch].spx_coord[0] = 1.0 / 32.0;
+        state.channels[ch].end_mant = 49;
+        // Drive the whole low-frequency region with a constant signal
+        // so the copy + notch is easy to read out.
+        for bin in 0..49 {
+            state.channels[ch].coeffs[bin] = 1.0;
+        }
+        // Enable the §3.6.4.2.3 notch with the half-attenuation row.
+        state.channels[ch].spx_atten_active = true;
+        state.channels[ch].spx_atten_code = 14;
+
+        apply_spectral_extension(&mut state, 1);
+
+        // Border is at spx_begin_tc = 49 → filter window [47, 51].
+        let expected = [0.5_f32, 0.25, 0.125, 0.25, 0.5];
+        for (i, exp) in expected.iter().enumerate() {
+            let bin = 47 + i;
+            // Bins 47, 48 are in the baseband (constant=1, scaled by tap).
+            // Bins 49, 50, 51 are in the SPX region (copied=1, then scaled
+            // by tap, then scaled by sblend=1 * coord=1/32 * 32 = 1).
+            assert!(
+                (state.channels[ch].coeffs[bin] - exp).abs() < 1e-4,
+                "border bin {bin} = {} expected {exp}",
+                state.channels[ch].coeffs[bin]
+            );
+        }
+        // Untouched neighbour: bin 46 (below the filter window).
+        assert!((state.channels[ch].coeffs[46] - 1.0).abs() < 1e-6);
+    }
+
+    /// With `spx_atten_active == false` the SPX synthesis is byte-
+    /// identical to the round-100 baseline — the border bins stay at the
+    /// copied value (no attenuation applied).
+    #[test]
+    fn spx_synthesis_no_atten_when_chinspxatten_off() {
+        let mut state = Ac3State::new();
+        let ch = 0usize;
+        state.spx_in_use = true;
+        state.channels[ch].in_spx = true;
+        state.spx_strtf = 0;
+        state.spx_begin_subbnd = 2;
+        state.spx_end_subbnd = 4;
+        state.spx_bndstrc = [false; 18];
+        state.spx_bndstrc[3] = true;
+        state.spx_nbnds = 1;
+        state.spx_bndsztab = [0; 18];
+        state.spx_bndsztab[0] = 24;
+        state.channels[ch].spx_sblend[0] = 1.0;
+        state.channels[ch].spx_nblend[0] = 0.0;
+        state.channels[ch].spx_coord[0] = 1.0 / 32.0;
+        state.channels[ch].end_mant = 49;
+        for bin in 0..49 {
+            state.channels[ch].coeffs[bin] = 1.0;
+        }
+        state.channels[ch].spx_atten_active = false;
+
+        apply_spectral_extension(&mut state, 1);
+
+        // Border bins are NOT attenuated.
+        for bin in 47..=51 {
+            assert!(
+                (state.channels[ch].coeffs[bin] - 1.0).abs() < 1e-4,
+                "no-atten border bin {bin} should stay at 1.0, got {}",
+                state.channels[ch].coeffs[bin]
+            );
+        }
+    }
+
+    /// §3.6.4.2.3 wrap-point filtering: when band 1's copy cursor wraps
+    /// back to `copystart`, a second 5-tap notch must apply at the start
+    /// of band 1 (`band_start - 2`). Construct a geometry where the
+    /// copy region is smaller than one band so the second band guarantees
+    /// a wrap, and verify a second attenuated 5-bin window appears.
+    #[test]
+    fn spx_synthesis_applies_wrap_notch_on_band_boundary() {
+        let mut state = Ac3State::new();
+        let ch = 0usize;
+        state.spx_in_use = true;
+        state.channels[ch].in_spx = true;
+        // Copy region = sub-bands 0..1 only (12 bins: [25, 37)). Two SPX
+        // bands of 12 each starting at sub-band 1 → spx region [37, 61).
+        // Each SPX band consumes 12 bins from a 12-bin copy region, so
+        // the second band MUST wrap.
+        state.spx_strtf = 0; // copystart = 25
+        state.spx_begin_subbnd = 1; // copyend = 37, spx_begin = 37
+        state.spx_end_subbnd = 3; // spx_end = 61
+        state.spx_bndstrc = [false; 18];
+        state.spx_nbnds = 2;
+        state.spx_bndsztab = [0; 18];
+        state.spx_bndsztab[0] = 12;
+        state.spx_bndsztab[1] = 12;
+        state.channels[ch].spx_sblend[0] = 1.0;
+        state.channels[ch].spx_nblend[0] = 0.0;
+        state.channels[ch].spx_coord[0] = 1.0 / 32.0;
+        state.channels[ch].spx_sblend[1] = 1.0;
+        state.channels[ch].spx_nblend[1] = 0.0;
+        state.channels[ch].spx_coord[1] = 1.0 / 32.0;
+        state.channels[ch].end_mant = 37;
+        for bin in 0..49 {
+            state.channels[ch].coeffs[bin] = 1.0;
+        }
+        state.channels[ch].spx_atten_active = true;
+        state.channels[ch].spx_atten_code = 14; // [0.5, 0.25, 0.125]
+
+        apply_spectral_extension(&mut state, 1);
+
+        // Band 1 starts at SPX bin 49 (37 + 12). Wrap notch is centred
+        // on the first bin of band 1 → filter window [47, 51].
+        // Border notch (always-applied) is centred on spx_begin_tc=37
+        // → filter window [35, 39].
+        let expected = [0.5_f32, 0.25, 0.125, 0.25, 0.5];
+        for (i, exp) in expected.iter().enumerate() {
+            let bin = 35 + i;
+            assert!(
+                (state.channels[ch].coeffs[bin] - exp).abs() < 1e-4,
+                "border-notch bin {bin} expected {exp} got {}",
+                state.channels[ch].coeffs[bin]
+            );
+        }
+        for (i, exp) in expected.iter().enumerate() {
+            let bin = 47 + i;
+            assert!(
+                (state.channels[ch].coeffs[bin] - exp).abs() < 1e-4,
+                "wrap-notch bin {bin} expected {exp} got {}",
+                state.channels[ch].coeffs[bin]
+            );
+        }
+        // Untouched between the two notches: bin 40..46 stay at 1.0.
+        for bin in 40..=46 {
+            assert!(
+                (state.channels[ch].coeffs[bin] - 1.0).abs() < 1e-4,
+                "bin {bin} between notches should be 1.0, got {}",
+                state.channels[ch].coeffs[bin]
+            );
+        }
     }
 }

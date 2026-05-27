@@ -213,6 +213,14 @@ pub struct AudFrm {
     /// Per-fbw-channel `transproclen[ch]` (8 bits, §2.3.2.23) — the time
     /// scaling length in samples. Only valid when `chintransproc[ch]`.
     pub transproclen: [u16; MAX_FBW],
+    /// Per-fbw-channel `chinspxatten[ch]` (§2.3.2.24 / Table E1.3) —
+    /// `true` when channel `ch` carries spectral-extension attenuation
+    /// data this frame. Only meaningful when `spxattene`.
+    pub chinspxatten: [bool; MAX_FBW],
+    /// Per-fbw-channel `spxattencod[ch]` (5 bits, §2.3.2.25) — index
+    /// into Table E3.14 (`SPX_ATTEN_TABLE`) for the border-notch filter
+    /// taps. Only valid when `chinspxatten[ch]`.
+    pub spxattencod: [u8; MAX_FBW],
 }
 
 impl AudFrm {
@@ -248,6 +256,8 @@ impl AudFrm {
             chintransproc: [false; MAX_FBW],
             transprocloc: [0; MAX_FBW],
             transproclen: [0; MAX_FBW],
+            chinspxatten: [false; MAX_FBW],
+            spxattencod: [0; MAX_FBW],
         }
     }
 }
@@ -493,12 +503,20 @@ fn parse_tail(br: &mut BitReader<'_>, a: &mut AudFrm, bsi: &Bsi) -> Result<()> {
         }
     }
 
-    // ---- spectral extension attenuation data ----
+    // ---- spectral extension attenuation data (§2.3.2.24-25) ----
+    //
+    // Captured per-fbw-channel so the SPX synthesis step
+    // (`audblk::apply_spectral_extension`) can apply the §3.6.4.2.3
+    // 5-tap notch filter at the baseband / extension border + every
+    // §3.6.4.1 translation-copy wrap point. `chinspxatten[ch]` is a
+    // frame-scoped flag (the spec emits it in audfrm, not audblk) and
+    // applies identically to every block of the syncframe.
     if a.spxattene {
-        for _ch in 0..nfchans {
+        for ch in 0..nfchans.min(MAX_FBW) {
             let chinspxatten = br.read_u32(1)? != 0;
+            a.chinspxatten[ch] = chinspxatten;
             if chinspxatten {
-                let _spxattencod = br.read_u32(5)?;
+                a.spxattencod[ch] = br.read_u32(5)? as u8;
             }
         }
     }

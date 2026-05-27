@@ -320,6 +320,23 @@ pub fn decode_indep_audblks(
         state.channels[ch].in_spx = false;
     }
 
+    // §3.6.4.2.3 — propagate the frame-scoped `chinspxatten[ch]` +
+    // `spxattencod[ch]` (read by the audfrm parser, Table E1.3) onto
+    // the per-channel state. The SPX synthesis step
+    // (`audblk::apply_spectral_extension`) consults these to apply the
+    // 5-tap border notch filter at the baseband/extension boundary and
+    // every translation-copy wrap point. When `spxattene == 0` for the
+    // frame, both flags stay cleared (no notch applied).
+    for ch in 0..nfchans {
+        if audfrm.spxattene {
+            state.channels[ch].spx_atten_active = audfrm.chinspxatten[ch];
+            state.channels[ch].spx_atten_code = audfrm.spxattencod[ch];
+        } else {
+            state.channels[ch].spx_atten_active = false;
+            state.channels[ch].spx_atten_code = 0;
+        }
+    }
+
     // ---- §3.4 AHT pre-buffered coefficients ----
     //
     // When `chahtinu[ch] == 1`, the audblk that decodes the FIRST
@@ -1793,11 +1810,15 @@ fn reject_unsupported(bsi: &Eac3Bsi, audfrm: &AudFrm) -> Result<()> {
     // `apply_transient_prenoise` after overlap-add (§E.3.7.2). The
     // baseband decode is unaffected by TPNP — it is a PCM-domain quality
     // enhancement layered on top of already-valid samples.
-    if audfrm.spxattene {
-        return Err(Error::unsupported(
-            "eac3 dsp: spectral-extension attenuation in use — round 2 mutes",
-        ));
-    }
+    //
+    // Spectral-extension attenuation (`spxattene`) is no longer a
+    // whole-frame reject either: the per-channel `chinspxatten[ch]` +
+    // `spxattencod[ch]` fields propagate onto state at the top of
+    // `decode_indep_audblks`, and `audblk::apply_spectral_extension`
+    // applies the §3.6.4.2.3 5-tap border notch filter when the flag
+    // is set for a channel. When `spxattene == 0` (every FFmpeg-encoded
+    // E-AC-3 fixture in the corpus picks this) the SPX synthesis path
+    // is byte-identical to the round-100 implementation.
     // ahte is now handled by the round-6 phase-B path (mono-only).
     // Defensive: reject any case where phase B was supposed to run
     // but didn't get a chance (caller forgot to call parse_phase_b).

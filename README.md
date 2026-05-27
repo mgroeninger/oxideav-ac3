@@ -220,6 +220,26 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       nchans`); real DSP (decouple + IMDCT + overlap-add) is
       deferred to round 2 along with dependent-substream
       recombination, AHT, and spectral extension.
+- [x] E-AC-3 decoder — **spectral-extension attenuation (SPXATTEN)**
+      decode (round 172 / r172). Lifts the round-2 `audfrm.spxattene == 1`
+      whole-frame reject: the audfrm parser now surfaces
+      `chinspxatten[ch]` (1 bit) + `spxattencod[ch]` (5 bits,
+      §2.3.2.24-25) into per-channel state, and
+      `audblk::apply_spectral_extension` applies the §3.6.4.2.3 5-tap
+      symmetric notch filter `[T[0], T[1], T[2], T[1], T[0]]` at the
+      baseband / extension border AND at every wrap point flagged
+      during the §3.6.4.1 translation copy. The 32-row attenuation
+      table (Table E3.14, `SPX_ATTEN_TABLE`) is transcribed directly
+      from the spec text; the kernel's last two taps come from
+      symmetry per spec ("last two attenuation values are determined
+      by symmetry and are not explicitly stored in the table"). When
+      `chinspxatten[ch] == 0` for a channel (or `spxattene == 0` for
+      the whole frame), synthesis is byte-identical to the round-100
+      baseline. No FFmpeg-encoded fixture in the corpus carries
+      `spxattene == 1`, so the landing is covered by 5 unit tests in
+      `audblk::spx_tests` rather than an end-to-end PSNR gate; matches
+      the round-103 (TPNP) / round-113 (LFE-AHT) / round-117
+      (coupling-AHT) precedent for corpus-untestable decoder paths.
 - [x] E-AC-3 decoder — **spectral extension (SPX)** decode (round 100 /
       r100). The audblk parser decodes the full §E.2.3.3 SPX strategy +
       coordinate syntax (`chinspx` / `spxstrtf` / `spxbegf` / `spxendf` /

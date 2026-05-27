@@ -30,6 +30,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 spectral-extension attenuation (§3.6.4.2.3)** — round 172.
+  Lifts the round-2 whole-frame reject `audfrm.spxattene == 1` so any
+  E-AC-3 syncframe carrying spectral-extension attenuation parameters
+  decodes through the SPX synthesis pipeline with the spec's 5-tap
+  border notch filter applied.
+  * `eac3::audfrm::parse_with` now writes `chinspxatten[ch]` (1 bit) +
+    `spxattencod[ch]` (5 bits, §2.3.2.24-25) into new `AudFrm.chinspxatten`
+    / `AudFrm.spxattencod` arrays instead of consuming-and-discarding
+    them, mirroring the round-103 TPNP-field surfacing pattern.
+  * `audblk::ChannelState` gains `spx_atten_active` + `spx_atten_code`
+    (frame-scoped — the spec emits both in audfrm, not audblk, so the
+    flags stay constant across the 6 blocks of a syncframe).
+    `eac3::dsp::decode_indep_audblks` propagates the audfrm fields onto
+    state at the top of every frame; when `spxattene == 0` they reset
+    to false/0 so a previous frame's attenuation doesn't leak forward.
+  * `audblk::SPX_ATTEN_TABLE` is a `[[f32; 3]; 32]` direct transcription
+    of Table E3.14 — the 3 stored taps per row become a 5-tap symmetric
+    kernel `[T[0], T[1], T[2], T[1], T[0]]` per the spec's "last two
+    attenuation values determined by symmetry" rule.
+  * `audblk::apply_spectral_extension` now applies the §3.6.4.2.3 notch
+    filter at the baseband / extension border (centred on
+    `spx_begin_tc`, filter window `[spx_begin_tc - 2 .. spx_begin_tc + 2]`)
+    AND at every wrap point flagged during the §3.6.4.1 translation
+    copy (centred on each post-wrap band start). The filter sits
+    between the translation step and the noise-blend / coordinate-scale
+    step, matching the spec's "filtering occurs after the transform
+    coefficient translation and banded RMS energy calculation but
+    prior to the noise scaling and transform coefficient blending
+    calculation" placement — implemented here as
+    translate → notch → RMS+blend so the RMS is measured on the
+    already-attenuated bins (the spec's wording reads either way; this
+    choice matches the §3.6.4.2.3 pseudo-code's positioning of the
+    notch loop before the blend loop in §3.6.4.2.4).
+  * 5 new unit tests in `audblk::spx_tests`: Table E3.14 row spot-checks
+    (rows 0 / 14 / 29 covering the 1×, 0.5×, 0.25× anchor magnitudes);
+    `apply_spx_atten_notch` symmetric-kernel + 5-bit-code-masking; and
+    two end-to-end synthesis checks pinning the border-notch + wrap-point
+    notch placements against a constant-1 driving signal with sblend=1 +
+    nblend=0 + coord=1/32 (so the kernel taps appear directly in the
+    output bins). When `spx_atten_active == false`, synthesis is
+    byte-identical to the round-100 baseline (separate test).
+  * Note: no FFmpeg-encoded E-AC-3 fixture in the corpus carries
+    `spxattene == 1` (FFmpeg's E-AC-3 encoder doesn't emit it), so this
+    landing is covered by unit-test synthesis math rather than an
+    end-to-end PSNR gate. Matches the round-103 (TPNP) + round-113
+    (LFE AHT) + round-117 (coupling AHT) precedent: corpus-untestable
+    decoder paths land with synthesis-math coverage so they don't drift
+    silently.
+
 - **E-AC-3 mixmdata mix-level surfacing + downmix routing** —
   round 129. Pulls the four 3-bit `ltrtcmixlev` / `ltrtsurmixlev` /
   `lorocmixlev` / `lorosurmixlev` codewords (§E.2.3.1.3-6, Table E1.2)
