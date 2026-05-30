@@ -69,6 +69,137 @@ pub struct Bsi {
     pub bits_consumed: u64,
 }
 
+impl Bsi {
+    /// Decode the raw `bsmod` value into a typed [`BitStreamMode`]
+    /// per Table 5.7. `bsmod == 0b111` is overloaded by `acmod` and
+    /// returns either [`BitStreamMode::VoiceOver`] (acmod=0b001) or
+    /// [`BitStreamMode::Karaoke`] (acmod ∈ {0b010..=0b111}); the
+    /// `bsmod==0b111 && acmod==0b000` combination is not defined by
+    /// the spec and maps to [`BitStreamMode::Reserved`].
+    ///
+    /// This is a thin convenience over [`Bsi::bsmod`] + [`Bsi::acmod`]
+    /// — the raw fields stay authoritative and an unmatched value
+    /// never panics here. A player can use the typed result to drive
+    /// service-routing (e.g. mute the dialogue-only `Dialogue` track
+    /// when also playing a main service, or surface the
+    /// `VisuallyImpaired` track to a screen-reader bus).
+    pub fn service_type(&self) -> BitStreamMode {
+        BitStreamMode::from_bsmod_acmod(self.bsmod, self.acmod)
+    }
+}
+
+/// Service-type classification of an AC-3 bit stream — Table 5.7
+/// "Bit Stream Mode". The encoding is keyed on `bsmod`; the `'111'`
+/// codepoint is overloaded and resolves with `acmod`'s help.
+///
+/// Spec §5.4.2.2: `bsmod` indicates whether the bit stream carries a
+/// main audio service (CM, ME, karaoke), an associated service
+/// (VI, HI, D, C, E, VO), or — for the unused `bsmod==0b111`
+/// /`acmod==0b000` combination — nothing defined.
+///
+/// Routing recommendations (from §5.4.2.2 and Table 5.7):
+///
+/// * **Main** services (`CompleteMain` / `MusicAndEffects` / `Karaoke`):
+///   the primary playback target. A receiver normally selects exactly
+///   one main service at a time.
+/// * **Associated** services may be mixed *on top of* a main service
+///   (e.g. `VisuallyImpaired` and `HearingImpaired` are descriptive
+///   narration / cleaned-dialogue mixes intended to substitute or
+///   augment the main mix; `Commentary` / `Emergency` / `VoiceOver`
+///   typically mix on top of a separate main).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitStreamMode {
+    /// `bsmod=0b000` — main audio service: complete main (CM).
+    CompleteMain,
+    /// `bsmod=0b001` — main audio service: music and effects (ME).
+    MusicAndEffects,
+    /// `bsmod=0b010` — associated service: visually impaired (VI).
+    VisuallyImpaired,
+    /// `bsmod=0b011` — associated service: hearing impaired (HI).
+    HearingImpaired,
+    /// `bsmod=0b100` — associated service: dialogue (D).
+    Dialogue,
+    /// `bsmod=0b101` — associated service: commentary (C).
+    Commentary,
+    /// `bsmod=0b110` — associated service: emergency (E).
+    Emergency,
+    /// `bsmod=0b111` + `acmod=0b001` (mono) — associated service:
+    /// voice over (VO).
+    VoiceOver,
+    /// `bsmod=0b111` + `acmod ∈ {0b010..=0b111}` — main audio
+    /// service: karaoke.
+    Karaoke,
+    /// `bsmod=0b111` + `acmod=0b000` — undefined by Table 5.7
+    /// (`bsmod==0b111` collides with the 1+1 dual-mono `acmod`).
+    /// Decoders should treat this as malformed metadata, not error.
+    Reserved,
+}
+
+impl BitStreamMode {
+    /// Resolve a `(bsmod, acmod)` pair into a typed service-type per
+    /// Table 5.7. Only the low 3 bits of each input are consulted.
+    pub fn from_bsmod_acmod(bsmod: u8, acmod: u8) -> Self {
+        match bsmod & 0x7 {
+            0b000 => BitStreamMode::CompleteMain,
+            0b001 => BitStreamMode::MusicAndEffects,
+            0b010 => BitStreamMode::VisuallyImpaired,
+            0b011 => BitStreamMode::HearingImpaired,
+            0b100 => BitStreamMode::Dialogue,
+            0b101 => BitStreamMode::Commentary,
+            0b110 => BitStreamMode::Emergency,
+            0b111 => match acmod & 0x7 {
+                0b000 => BitStreamMode::Reserved,
+                0b001 => BitStreamMode::VoiceOver,
+                _ => BitStreamMode::Karaoke,
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// `true` for a main audio service (CM, ME, or karaoke). A
+    /// receiver picking a default playback target should normally
+    /// route a main service first.
+    pub fn is_main(self) -> bool {
+        matches!(
+            self,
+            BitStreamMode::CompleteMain | BitStreamMode::MusicAndEffects | BitStreamMode::Karaoke
+        )
+    }
+
+    /// `true` for an associated service (VI / HI / D / C / E / VO).
+    /// These are typically mixed on top of a separately-decoded main
+    /// service.
+    pub fn is_associated(self) -> bool {
+        matches!(
+            self,
+            BitStreamMode::VisuallyImpaired
+                | BitStreamMode::HearingImpaired
+                | BitStreamMode::Dialogue
+                | BitStreamMode::Commentary
+                | BitStreamMode::Emergency
+                | BitStreamMode::VoiceOver
+        )
+    }
+
+    /// Short ASCII mnemonic per Table 5.7 (e.g. "CM", "ME", "VI",
+    /// "HI", "D", "C", "E", "VO", "K"). Stable for UI / logging.
+    /// Returns "?" for [`BitStreamMode::Reserved`].
+    pub fn mnemonic(self) -> &'static str {
+        match self {
+            BitStreamMode::CompleteMain => "CM",
+            BitStreamMode::MusicAndEffects => "ME",
+            BitStreamMode::VisuallyImpaired => "VI",
+            BitStreamMode::HearingImpaired => "HI",
+            BitStreamMode::Dialogue => "D",
+            BitStreamMode::Commentary => "C",
+            BitStreamMode::Emergency => "E",
+            BitStreamMode::VoiceOver => "VO",
+            BitStreamMode::Karaoke => "K",
+            BitStreamMode::Reserved => "?",
+        }
+    }
+}
+
 /// Annex D §2.3.1.3-6 alternate-syntax mix-level codewords. Each is a
 /// 3-bit value; Tables D2.3 / D2.4 / D2.5 / D2.6 map them to linear
 /// gains via [`annex_d_lt_rt_clev`] / [`annex_d_lt_rt_slev`] /
@@ -597,5 +728,191 @@ mod tests {
                 annex_d_surround_mix_gain(code)
             );
         }
+    }
+
+    /// Table 5.7 — every `bsmod` codepoint except `0b111` resolves to a
+    /// fixed service type independent of `acmod`. Spot-check each row
+    /// with a couple of `acmod` values to confirm the resolver doesn't
+    /// peek at `acmod` when `bsmod != 0b111`.
+    #[test]
+    fn bsmod_table_5_7_fixed_codepoints() {
+        use BitStreamMode::*;
+        let rows: [(u8, BitStreamMode); 7] = [
+            (0b000, CompleteMain),
+            (0b001, MusicAndEffects),
+            (0b010, VisuallyImpaired),
+            (0b011, HearingImpaired),
+            (0b100, Dialogue),
+            (0b101, Commentary),
+            (0b110, Emergency),
+        ];
+        for (bsmod, want) in rows {
+            for acmod in 0u8..=7 {
+                let got = BitStreamMode::from_bsmod_acmod(bsmod, acmod);
+                assert_eq!(
+                    got, want,
+                    "bsmod=0b{bsmod:03b} acmod=0b{acmod:03b}: want {want:?}, got {got:?}"
+                );
+            }
+        }
+    }
+
+    /// Table 5.7 — `bsmod==0b111` is overloaded: acmod=0b001 → VoiceOver,
+    /// acmod ∈ {0b010..=0b111} → Karaoke, acmod=0b000 (the 1+1 dual-mono
+    /// slot) → Reserved (no Table 5.7 row defines it).
+    #[test]
+    fn bsmod_0b111_resolves_with_acmod() {
+        assert_eq!(
+            BitStreamMode::from_bsmod_acmod(0b111, 0b000),
+            BitStreamMode::Reserved
+        );
+        assert_eq!(
+            BitStreamMode::from_bsmod_acmod(0b111, 0b001),
+            BitStreamMode::VoiceOver
+        );
+        for acmod in 0b010u8..=0b111 {
+            assert_eq!(
+                BitStreamMode::from_bsmod_acmod(0b111, acmod),
+                BitStreamMode::Karaoke,
+                "acmod=0b{acmod:03b}"
+            );
+        }
+    }
+
+    /// `is_main` / `is_associated` partition Table 5.7 cleanly. CM, ME,
+    /// and karaoke are main; VI/HI/D/C/E/VO are associated; the unused
+    /// `bsmod=0b111 acmod=0b000` cell is neither.
+    #[test]
+    fn main_vs_associated_partition() {
+        use BitStreamMode::*;
+        let main = [CompleteMain, MusicAndEffects, Karaoke];
+        let assoc = [
+            VisuallyImpaired,
+            HearingImpaired,
+            Dialogue,
+            Commentary,
+            Emergency,
+            VoiceOver,
+        ];
+        for m in main {
+            assert!(m.is_main(), "{m:?} should be main");
+            assert!(!m.is_associated(), "{m:?} should not be associated");
+        }
+        for a in assoc {
+            assert!(a.is_associated(), "{a:?} should be associated");
+            assert!(!a.is_main(), "{a:?} should not be main");
+        }
+        assert!(!Reserved.is_main());
+        assert!(!Reserved.is_associated());
+    }
+
+    /// Mnemonics are stable per Table 5.7 — used in CLI / log output.
+    /// "?" is reserved for the Reserved case so downstream code can
+    /// rely on a single sentinel for "no service type".
+    #[test]
+    fn mnemonics_are_table_5_7_short_forms() {
+        use BitStreamMode::*;
+        let rows: [(BitStreamMode, &str); 10] = [
+            (CompleteMain, "CM"),
+            (MusicAndEffects, "ME"),
+            (VisuallyImpaired, "VI"),
+            (HearingImpaired, "HI"),
+            (Dialogue, "D"),
+            (Commentary, "C"),
+            (Emergency, "E"),
+            (VoiceOver, "VO"),
+            (Karaoke, "K"),
+            (Reserved, "?"),
+        ];
+        for (mode, mnem) in rows {
+            assert_eq!(mode.mnemonic(), mnem, "{mode:?}");
+        }
+    }
+
+    /// `Bsi::service_type()` round-trips the raw bsmod/acmod into the
+    /// typed enum. Reuses the minimal 2/0 stereo fixture (acmod=2,
+    /// bsmod=0) and a custom 1/0 mono bsmod=0b111 builder to cover
+    /// both the simple and overloaded branches end-to-end through the
+    /// `Bsi` accessor.
+    #[test]
+    fn bsi_service_type_accessor_routes_through_table_5_7() {
+        // The minimal 2/0 stereo fixture sets bsmod=0, acmod=2 →
+        // CompleteMain. Re-built locally so the test stays
+        // self-contained.
+        let stereo_bits: [(u8, u32); 14] = [
+            (5, 0b01000),
+            (3, 0b000),
+            (3, 0b010),
+            (2, 0b00),
+            (1, 0),
+            (5, 27),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+        ];
+        let stereo_bytes = pack_bits(&stereo_bits);
+        let bsi = parse(&stereo_bytes).expect("parse minimal 2/0");
+        assert_eq!(bsi.bsmod, 0b000);
+        assert_eq!(bsi.acmod, 0b010);
+        assert_eq!(bsi.service_type(), BitStreamMode::CompleteMain);
+
+        // 1/0 mono BSI with bsmod=0b111 + acmod=0b001 → VoiceOver.
+        // acmod=1 means no cmix / no surmix / no dsurmod optional fields.
+        //   bsid=8       (5)  : 0b01000
+        //   bsmod=0b111  (3)  : 0b111
+        //   acmod=0b001  (3)  : 0b001
+        //   lfeon=0      (1)  : 0
+        //   dialnorm=27  (5)  : 0b11011
+        //   compre=0     (1)  : 0
+        //   langcode=0   (1)  : 0
+        //   audprodie=0  (1)  : 0
+        //   copyrightb=0 (1)  : 0
+        //   origbs=0     (1)  : 0
+        //   timecod1e=0  (1)  : 0
+        //   timecod2e=0  (1)  : 0
+        //   addbsie=0    (1)  : 0
+        let voiceover_bits: [(u8, u32); 13] = [
+            (5, 0b01000),
+            (3, 0b111),
+            (3, 0b001),
+            (1, 0),
+            (5, 27),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+        ];
+        let voiceover_bytes = pack_bits(&voiceover_bits);
+        let bsi = parse(&voiceover_bytes).expect("parse 1/0 voiceover");
+        assert_eq!(bsi.bsmod, 0b111);
+        assert_eq!(bsi.acmod, 0b001);
+        assert_eq!(bsi.service_type(), BitStreamMode::VoiceOver);
+    }
+
+    /// MSB-first bit packer matching the AC-3 `BitReader` order — used
+    /// by the Table 5.7 service-type tests to build synthetic BSIs.
+    fn pack_bits(bits: &[(u8, u32)]) -> Vec<u8> {
+        let total_bits: usize = bits.iter().map(|(n, _)| *n as usize).sum();
+        let mut out = vec![0u8; total_bits.div_ceil(8) + 1];
+        let mut bitpos = 0usize;
+        for (n, v) in bits.iter().copied() {
+            for i in (0..n).rev() {
+                let bit = ((v >> i) & 1) as u8;
+                let byte = bitpos / 8;
+                let shift = 7 - (bitpos % 8);
+                out[byte] |= bit << shift;
+                bitpos += 1;
+            }
+        }
+        out
     }
 }

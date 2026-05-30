@@ -11,7 +11,26 @@ framework but usable standalone.
 
 Early WIP. Implementation follows the A/52 spec incrementally:
 
-- [x] Sync frame + BSI parse (§5.3 / §5.4.1-2)
+- [x] Sync frame + BSI parse (§5.3 / §5.4.1-2). **Round 193**
+      surfaces a typed `BitStreamMode` enum + `Bsi::service_type()`
+      accessor that decodes Table 5.7 ("Bit Stream Mode") — the
+      eight `bsmod` codepoints map to `CompleteMain` /
+      `MusicAndEffects` / `VisuallyImpaired` / `HearingImpaired` /
+      `Dialogue` / `Commentary` / `Emergency`, and the overloaded
+      `bsmod=0b111` resolves via `acmod` to `VoiceOver`
+      (`acmod=0b001`) or `Karaoke` (`acmod ∈ {0b010..=0b111}`); the
+      undefined `bsmod=0b111 acmod=0b000` cell falls into
+      `Reserved`. `is_main()` / `is_associated()` partition the
+      table for routing (a receiver picks at most one main service
+      and mixes associated services on top), and a stable
+      `mnemonic()` returns the Table 5.7 short forms
+      (`"CM"/"ME"/"VI"/"HI"/"D"/"C"/"E"/"VO"/"K"/"?"`) for
+      CLI / logging. The raw `bsmod` / `acmod` fields stay public
+      and authoritative; the new surface is a thin convenience over
+      them. 5 new tests cover the fixed-codepoint rows, the
+      overloaded-`0b111` branch, the main/associated partition,
+      mnemonic stability, and the `Bsi::service_type()` accessor
+      round-trip through `parse()`.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

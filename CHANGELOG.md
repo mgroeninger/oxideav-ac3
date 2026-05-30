@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Typed `BitStreamMode` accessor for §5.4.2.2 / Table 5.7**
+  (round 193 / r193). The raw `Bsi::bsmod` and `Bsi::acmod` fields
+  were already public, but Table 5.7's classification of the
+  8 `bsmod` codepoints into main / associated services (with
+  `bsmod=0b111` overloaded on `acmod` for the VoiceOver vs Karaoke
+  split) had to be re-derived by every caller. `bsi::BitStreamMode`
+  is a 10-variant enum covering every cell — `CompleteMain` /
+  `MusicAndEffects` / `VisuallyImpaired` / `HearingImpaired` /
+  `Dialogue` / `Commentary` / `Emergency` / `VoiceOver` / `Karaoke`
+  / `Reserved` — and `Bsi::service_type()` returns it by
+  delegating to `BitStreamMode::from_bsmod_acmod(bsmod, acmod)`.
+  `is_main()` / `is_associated()` partition the table for
+  service-routing logic (a receiver normally selects a single main
+  service and mixes associated services on top), and `mnemonic()`
+  returns the Table 5.7 short forms (`"CM"`, `"ME"`, `"VI"`, `"HI"`,
+  `"D"`, `"C"`, `"E"`, `"VO"`, `"K"`, `"?"` for the undefined
+  `bsmod=0b111 acmod=0b000` cell) for CLI / log output. The raw
+  fields stay authoritative and the accessor never panics on an
+  unmatched value. 5 new unit tests cover the fixed-codepoint
+  rows, the overloaded-`0b111` branch (`acmod=0b000` →
+  `Reserved`, `acmod=0b001` → `VoiceOver`, `acmod ∈ {0b010..=0b111}`
+  → `Karaoke`), the main / associated partition, mnemonic
+  stability, and a `Bsi::service_type()` round-trip through
+  `parse()` on a synthetic 1/0 mono `bsmod=0b111 acmod=0b001`
+  voice-over BSI. Lib tests 156 pass (was 151, +5 new); integration
+  tests pass; clippy clean; rustfmt clean.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.7...v0.0.8) - 2026-05-30
 
 ### Other
