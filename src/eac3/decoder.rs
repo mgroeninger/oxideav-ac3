@@ -39,6 +39,7 @@ use crate::audblk::{Ac3State, SAMPLES_PER_BLOCK};
 
 use super::audfrm::{self, AudFrm};
 use super::bsi::{self, Bsi as Eac3Bsi, StreamType};
+use super::chanmap::{self, ChannelLocation};
 use super::dsp;
 
 /// E-AC-3 syncword — same value as base AC-3 (§E.2.2.1).
@@ -77,6 +78,16 @@ pub struct Eac3DecoderState {
     indep_samples_per_frame: u32,
     /// Per-frame error string (last seen). Diagnostic only.
     pub last_error: Option<String>,
+    /// Physical channel locations of dep-substream channels that were
+    /// spliced into [`Self::indep_pcm_f32`] during the most recent
+    /// packet, in the order they were appended. Always one entry per
+    /// dep coded channel, matching the §E.2.3.1.8 chanmap expansion
+    /// (Table E2.5). Empty when no dep substream contributed, or when
+    /// the dep substream's `chanmape == 0` (in which case the dep
+    /// channels are routed by the spec's "channel locations apply in
+    /// the natural order" default for the dep's `acmod` / `lfeon` —
+    /// see [`Self::default_dep_locations`]).
+    pub dep_locations: Vec<ChannelLocation>,
 }
 
 impl Eac3DecoderState {
@@ -99,6 +110,77 @@ impl Eac3DecoderState {
     /// Current channel count of [`Self::indep_pcm_f32`].
     pub fn indep_nchans(&self) -> u16 {
         self.indep_nchans
+    }
+
+    /// Channel-location list assigned to the dep substream when
+    /// `chanmape == 0` (no custom channel map present), per
+    /// §E.2.3.1.7: "the channel map for a dependent substream shall
+    /// be defined by the audio coding mode" (the dep substream's
+    /// `acmod` + `lfeon`).
+    ///
+    /// Maps the dep substream's `acmod` to the natural Table 5.8
+    /// channel order (L, C, R, Ls, Rs, …) plus LFE when `lfeon`.
+    /// `acmod == 0` (1+1 dual mono) is treated as two anonymous
+    /// channels assigned to `Left` / `Right` slots.
+    pub fn default_dep_locations(acmod: u8, lfeon: bool) -> Vec<ChannelLocation> {
+        let mut out: Vec<ChannelLocation> = Vec::with_capacity(6);
+        match acmod {
+            0 => {
+                // 1+1 dual mono — two independent channels with no
+                // canonical assignment. Default to L / R.
+                out.push(ChannelLocation::Left);
+                out.push(ChannelLocation::Right);
+            }
+            1 => {
+                // 1/0 mono — Center.
+                out.push(ChannelLocation::Center);
+            }
+            2 => {
+                // 2/0 stereo — L, R.
+                out.push(ChannelLocation::Left);
+                out.push(ChannelLocation::Right);
+            }
+            3 => {
+                // 3/0 — L, C, R.
+                out.push(ChannelLocation::Left);
+                out.push(ChannelLocation::Center);
+                out.push(ChannelLocation::Right);
+            }
+            4 => {
+                // 2/1 — L, R, S (treated as center-surround per
+                // Table E2.5 bit 7).
+                out.push(ChannelLocation::Left);
+                out.push(ChannelLocation::Right);
+                out.push(ChannelLocation::CenterSurround);
+            }
+            5 => {
+                // 3/1 — L, C, R, S.
+                out.push(ChannelLocation::Left);
+                out.push(ChannelLocation::Center);
+                out.push(ChannelLocation::Right);
+                out.push(ChannelLocation::CenterSurround);
+            }
+            6 => {
+                // 2/2 — L, R, Ls, Rs.
+                out.push(ChannelLocation::Left);
+                out.push(ChannelLocation::Right);
+                out.push(ChannelLocation::LeftSurround);
+                out.push(ChannelLocation::RightSurround);
+            }
+            7 => {
+                // 3/2 — L, C, R, Ls, Rs.
+                out.push(ChannelLocation::Left);
+                out.push(ChannelLocation::Center);
+                out.push(ChannelLocation::Right);
+                out.push(ChannelLocation::LeftSurround);
+                out.push(ChannelLocation::RightSurround);
+            }
+            _ => {}
+        }
+        if lfeon {
+            out.push(ChannelLocation::Lfe);
+        }
+        out
     }
 }
 
@@ -143,6 +225,17 @@ pub struct DecodedFrame {
     /// constructor uses these as overrides for the §7.8.2 fixed-0.707
     /// LtRt defaults and the 0.707 LoRo defaults.
     pub annex_e_mix_levels: Option<crate::bsi::AnnexDMixLevels>,
+    /// Physical channel locations for the dep-substream channels
+    /// appended to the indep program, in append order
+    /// (§E.2.3.1.7-8). One entry per **dep** coded channel, derived
+    /// from `chanmap` (Table E2.5) when `chanmape == 1` or from the
+    /// dep substream's `acmod`/`lfeon` natural order when
+    /// `chanmape == 0`. Empty when no dep substream contributed.
+    ///
+    /// The indep program's channels occupy slots `0..nfchans+lfeon`
+    /// (in `acmod` bitstream order); the dep channels occupy slots
+    /// `indep_nchans..` in the order of this list.
+    pub dep_locations: Vec<ChannelLocation>,
 }
 
 /// Decode one or more concatenated E-AC-3 syncframes contained in a
@@ -159,6 +252,7 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
     let mut indep_pcm: Option<DecodedFrame> = None;
     let mut off = 0usize;
     state.last_error = None;
+    state.dep_locations.clear();
     while off + 4 <= data.len() {
         // §E.2.2.1 — syncword.
         let sync = u16::from_be_bytes([data[off], data[off + 1]]);
@@ -243,6 +337,11 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
         pcm.channels = state.indep_nchans;
         pcm.pcm_s16le = pack_f32_to_s16le(&state.indep_pcm_f32);
     }
+    // Surface the accumulated dep-channel locations so callers know
+    // the physical assignment of the appended channels without
+    // re-parsing the chanmap. Empty when no dep substream
+    // contributed.
+    pcm.dep_locations.clone_from(&state.dep_locations);
     Ok(pcm)
 }
 
@@ -294,6 +393,10 @@ fn decode_indep_substream(
         lfeon: bsi.lfeon,
         nfchans: bsi.nfchans,
         annex_e_mix_levels: bsi.annex_e_mix_levels,
+        // Indep-substream-only emit: no dep channels yet. The
+        // packet-level driver overwrites this with the accumulated
+        // `state.dep_locations` if dep substreams follow.
+        dep_locations: Vec::new(),
     })
 }
 
@@ -329,9 +432,26 @@ fn decode_dep_substream(
         )));
     }
 
-    // Decode the dep substream into its own f32 buffer. Round 3 reuses
-    // the indep DSP path; the dep substream's audblks have the same
-    // syntax (Table E1.4 doesn't branch on strmtyp).
+    // Resolve the dep substream's per-channel location list per
+    // §E.2.3.1.7-8 BEFORE decoding the DSP. When `chanmape == 1` the
+    // chanmap field selects locations from Table E2.5 and the
+    // expanded count MUST equal `dep_nchans` (spec invariant). When
+    // `chanmape == 0` the locations default to the natural-acmod
+    // order (e.g. acmod=2 → [Left, Right]).
+    let dep_locations = match bsi.chanmap {
+        Some(map) => match chanmap::expand_chanmap_locations(map, dep_nchans as u8) {
+            Ok(locs) => locs,
+            Err(e) => {
+                state.last_error = Some(format!("eac3 dep chanmap: {e}"));
+                return Err(Error::invalid(format!("eac3 dep chanmap: {e}")));
+            }
+        },
+        None => Eac3DecoderState::default_dep_locations(bsi.acmod, bsi.lfeon),
+    };
+
+    // Decode the dep substream into its own f32 buffer. The dep
+    // substream's audblks have the same syntax (Table E1.4 doesn't
+    // branch on strmtyp).
     let mut dep_floats = vec![0.0f32; samples as usize * dep_nchans];
     if let Err(e) =
         dsp::decode_indep_audblks(bsi, audfrm, br, &mut state.dep_state, &mut dep_floats)
@@ -345,6 +465,12 @@ fn decode_dep_substream(
 
     // Splice channels per chanmap (Table E2.5).
     splice_dep_into_indep(state, bsi, &dep_floats);
+
+    // Record the per-dep-channel locations so callers (e.g. a future
+    // WAV-mask reorderer or the §7.8 downmix when extended to 7.1)
+    // can find Lb/Rb without re-parsing the chanmap.
+    state.dep_locations.extend(dep_locations);
+
     Ok(state.indep_nchans)
 }
 
@@ -420,6 +546,9 @@ fn build_silent_indep(bsi: &Eac3Bsi) -> Result<DecodedFrame> {
         lfeon: bsi.lfeon,
         nfchans: bsi.nfchans,
         annex_e_mix_levels: bsi.annex_e_mix_levels,
+        // Silent-fallback path emits the indep program only — no
+        // dep channels were spliced.
+        dep_locations: Vec::new(),
     })
 }
 

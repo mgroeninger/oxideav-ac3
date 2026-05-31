@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 dependent-substream chanmap routing (Table E2.5)**
+  (round 196 / r196). The decoder now decodes the 16-bit `chanmap`
+  field on each dependent substream into an ordered list of
+  physical channel locations per §E.2.3.1.7-8. A new
+  `eac3::chanmap::ChannelLocation` enum covers all 22 distinct
+  Table E2.5 locations — including the 6 pair-bits (Lc/Rc, Lrs/Rrs,
+  Lsd/Rsd, Lw/Rw, Vhl/Vhr, Lts/Rts) which each expand to two
+  consecutive channels in the order documented by the spec text
+  ("the first coded channel is the Left Surround channel, the
+  second coded channel is the Right Surround channel"). The decoder
+  validates the spec invariant that the expanded chanmap count
+  must equal the dep substream's `acmod`/`lfeon`-derived coded
+  channel count (§E.2.3.1.8 last paragraph) and rejects mismatched
+  bit-streams with a typed `ChanmapError::CountMismatch`. When
+  `chanmape == 0`, `Eac3DecoderState::default_dep_locations` falls
+  back to the natural-acmod order per §E.2.3.1.7. The resolved
+  `dep_locations` list is surfaced on `Eac3DecoderState` AND on
+  `DecodedFrame.dep_locations`, so consumers (a future WAV-mask
+  7.1 reorderer or a chanmap-aware §7.8 downmix matrix) can route
+  the appended dep channels without re-parsing the bitstream. The
+  splice itself still appends dep channels at the end of the indep
+  program — the new metadata is the foundation for future routing
+  work, not a behavioural change for current acmod-native
+  consumers. 6 new unit tests cover both literal spec examples
+  (§E.2.3.1.8 bits 0/3/4 and bits 3/4/6 pair), the in-tree 7.1
+  encoder's Lrs/Rrs pair (chanmap=0x0200), single-bit-only
+  decodes, MSB/LSB extremes, and the count-mismatch rejection.
+  1 new integration test in `tests/eac3_ffmpeg.rs` round-trips
+  the encoder's 7.1 indep+dep pair through the in-tree decoder
+  and asserts `dep_locations == [LeftRearSurround,
+  RightRearSurround]` on every packet.
+
 - **Typed `BitStreamMode` accessor for §5.4.2.2 / Table 5.7**
   (round 193 / r193). The raw `Bsi::bsmod` and `Bsi::acmod` fields
   were already public, but Table 5.7's classification of the

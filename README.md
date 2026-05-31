@@ -344,6 +344,32 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       no corpus fixture carries `transproce == 1`, so the synthesis math
       is covered by 4 unit tests (`eac3::dsp::tpnp_tests`) rather than an
       end-to-end PSNR gate.
+- [x] E-AC-3 decoder — **dependent-substream chanmap routing**
+      (round 196 / r196). The 16-bit `chanmap` field (§E.2.3.1.8 /
+      Table E2.5) now decodes into an ordered list of physical channel
+      locations on every dep substream: a new
+      `eac3::chanmap::ChannelLocation` enum covers all 22 distinct
+      Table E2.5 locations including the 6 pair-bits (Lc/Rc, Lrs/Rrs,
+      Lsd/Rsd, Lw/Rw, Vhl/Vhr, Lts/Rts) which each expand to two
+      consecutive channels per the spec text. The decoder enforces the
+      §E.2.3.1.8 invariant that the expanded chanmap count equal the
+      dep substream's coded channel count (`acmod_nfchans + lfeon`)
+      and surfaces the resolved location list on
+      `Eac3DecoderState.dep_locations` and `DecodedFrame.dep_locations`
+      — so a future 7.1 WAV-mask reorderer or a chanmap-aware §7.8
+      downmix can route the appended dep channels without re-parsing
+      the bitstream. The splice itself still appends dep channels at
+      the end of the indep program; the new metadata is the foundation
+      for future routing work, not a behavioural change for current
+      acmod-native consumers. When `chanmape == 0` the locations
+      default to the natural-acmod order per §E.2.3.1.7. Covered by
+      6 new unit tests (both spec examples from §E.2.3.1.8 verbatim,
+      the in-tree 7.1 encoder's Lrs/Rrs pair, single-bit-only decodes,
+      MSB/LSB extremes, and the count-mismatch rejection) and a new
+      integration test that round-trips the encoder's 7.1 indep+dep
+      pair through the in-tree decoder asserting
+      `dep_locations == [LeftRearSurround, RightRearSurround]` on
+      every packet.
 - [x] E-AC-3 decoder — **Adaptive Hybrid Transform (AHT)** decode,
       multichannel full-bandwidth + LFE + coupling (round 6 mono →
       round 110 fbw → round 113 LFE → round 117 coupling / r117). The

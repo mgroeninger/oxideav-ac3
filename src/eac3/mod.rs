@@ -62,6 +62,7 @@
 pub mod aht;
 pub mod audfrm;
 pub mod bsi;
+pub mod chanmap;
 pub mod decoder;
 pub mod dsp;
 pub mod encoder;

@@ -426,3 +426,71 @@ fn eac3_71_pair_decodes_through_ffmpeg() {
          L-energy={left_energy:.3}, samples={nsamp}"
     );
 }
+
+/// In-tree round-trip: encode a 7.1 fixture, feed the indep+dep pair
+/// to the in-tree decoder, and confirm the per-frame `dep_locations`
+/// list resolves to `[LeftRearSurround, RightRearSurround]` — the
+/// Lb/Rb pair carried by the dep substream with chanmap bit 6
+/// (Lrs/Rrs pair) set per §E.2.3.1.8 / Table E2.5.
+///
+/// This test pins the contract that the decoder reports back the
+/// physical channel assignment of the appended dep channels, so
+/// downstream consumers (a future WAV-mask 7.1 reorderer or a
+/// chanmap-aware §7.8 downmix) can route them without re-parsing
+/// the bitstream.
+#[test]
+fn eac3_71_decoder_surfaces_chanmap_lrs_rrs() {
+    use oxideav_ac3::eac3::chanmap::ChannelLocation;
+    use oxideav_ac3::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+
+    let pcm = build_sine_pcm_71();
+    let bytes = encode_eac3(&pcm, 8, 576_000);
+    assert!(!bytes.is_empty(), "encoder produced no bytes");
+
+    // Walk packet-by-packet: each packet is one indep+dep pair (1536
+    // + 768 = 2304 bytes at the chosen 384k+192k bit rates).
+    let indep_bytes = 1536usize;
+    let dep_bytes = 768usize;
+    let pair_bytes = indep_bytes + dep_bytes;
+    assert_eq!(bytes.len() % pair_bytes, 0);
+
+    let mut st = Eac3DecoderState::default();
+    let mut seen_lrs_rrs = 0usize;
+    let mut seen_packets = 0usize;
+
+    let mut off = 0usize;
+    while off + pair_bytes <= bytes.len() {
+        let pkt = &bytes[off..off + pair_bytes];
+        let frame = decode_eac3_packet(&mut st, pkt).expect("decode 7.1 indep+dep packet");
+        // Indep substream is acmod=7 (5 fbw) + lfeon=1 → 6 chans,
+        // plus 2 dep chans = 8.
+        assert_eq!(
+            frame.channels, 8,
+            "7.1 indep+dep packet should yield 8 channels (got {})",
+            frame.channels
+        );
+        // The dep_locations vector must have exactly one entry per
+        // dep coded channel (here: 2).
+        assert_eq!(
+            frame.dep_locations.len(),
+            2,
+            "expected 2 dep-channel locations (Lrs/Rrs pair), got {}",
+            frame.dep_locations.len()
+        );
+        // Spec example for chanmap bit 6 (§E.2.3.1.8 / Table E2.5):
+        // pair = Left Rear Surround / Right Rear Surround.
+        if frame.dep_locations[0] == ChannelLocation::LeftRearSurround
+            && frame.dep_locations[1] == ChannelLocation::RightRearSurround
+        {
+            seen_lrs_rrs += 1;
+        }
+        seen_packets += 1;
+        off += pair_bytes;
+    }
+    assert!(seen_packets > 0, "no packets walked");
+    assert_eq!(
+        seen_lrs_rrs, seen_packets,
+        "every packet should report dep_locations = [Lrs, Rrs] \
+         (saw {seen_lrs_rrs}/{seen_packets})"
+    );
+}
