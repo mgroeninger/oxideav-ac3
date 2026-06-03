@@ -1861,6 +1861,13 @@ fn build_ac3_bsi_shim(bsi: &Eac3Bsi) -> Ac3Bsi {
         timecod1: None,
         timecod2: None,
         timecode_presence: crate::bsi::TimeCodePresence::NotPresent,
+        // Forward the Annex E informational-metadata `copyrightb` /
+        // `origbs` pair when present; default to the encoder-default
+        // unset pair (no policy hint) when the upstream BSI did not
+        // surface them (`infomdate == 0`).
+        copyright_info: bsi
+            .copyright_info
+            .unwrap_or(crate::bsi::CopyrightInfo::from_bits(false, false)),
         bits_consumed: 0,
     }
 }
@@ -2055,6 +2062,7 @@ mod aht_regs_tests {
             adconvtyp_ch2: None,
             audio_production: None,
             audio_production_ch2: None,
+            copyright_info: None,
             frame_bytes: 768,
             bits_consumed: 0,
         }

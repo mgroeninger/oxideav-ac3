@@ -134,6 +134,14 @@ pub struct Bsi {
     /// `timecod*e` slots carry `xbsi*e` instead and the timecode is
     /// definitionally absent).
     pub timecode_presence: TimeCodePresence,
+    /// §5.4.2.24-25 distribution-control hint pair (`copyrightb` +
+    /// `origbs`). Always present — every base AC-3 syncframe carries
+    /// both 1-bit fields unconditionally per the BSI bit layout
+    /// (`bit_stream_info()` syntax in §5.3.2). The decoder PCM path
+    /// does not consult these bits; surfacing them lets a chain
+    /// consumer enforce a distribution / archive policy without
+    /// re-parsing the BSI.
+    pub copyright_info: CopyrightInfo,
     /// Absolute bit position (in bits, measured from the first byte of
     /// `bsi()` input) where the BSI ended. Callers use this to skip
     /// straight to the audio-block area.
@@ -756,6 +764,72 @@ impl TimeCodePresence {
     }
 }
 
+/// §5.4.2.24-25 distribution-control hint pair — the `copyrightb`
+/// (Copyright Bit) + `origbs` (Original Bit Stream) flags. Both are
+/// 1-bit fields placed back-to-back in every BSI's mandatory section
+/// (§5.3.2 — they live just after the optional `audprodie` / `roomtyp2`
+/// chain and just before the `timecod*e` / `xbsi*e` slots, with no
+/// per-acmod gate).
+///
+/// Per spec text:
+///
+/// * `copyrightb == 1` — the bitstream is indicated as
+///   copyright-protected (§5.4.2.24). `0` — not indicated as
+///   protected.
+/// * `origbs == 1` — this is an original bitstream (§5.4.2.25). `0` —
+///   this is a copy of another bitstream.
+///
+/// The decoder does not act on either bit; surfacing them lets a chain
+/// consumer enforce a distribution / archival policy (e.g. refuse to
+/// re-encode a `copyrightb == 1` stream, or tag a `origbs == 0` copy
+/// for downstream-only routing) without re-parsing the BSI.
+///
+/// On the Annex E (E-AC-3) side the same `copyrightb` / `origbs` pair
+/// is carried inside the §E.2.3.1.62 informational-metadata block
+/// (gated by `infomdate == 1`) and surfaces as
+/// `eac3::Bsi::copyright_info` — see [`crate::eac3::bsi::Bsi`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyrightInfo {
+    copyrightb: bool,
+    origbs: bool,
+}
+
+impl CopyrightInfo {
+    /// Build a [`CopyrightInfo`] from the raw 1-bit `copyrightb` /
+    /// `origbs` values. Inputs are taken as booleans so the call site
+    /// stays clean — the BSI parser passes the bit-shift result of
+    /// each `read_u32(1)?` cast through `!= 0`.
+    pub fn from_bits(copyrightb: bool, origbs: bool) -> Self {
+        Self { copyrightb, origbs }
+    }
+
+    /// `true` when the encoder set the `copyrightb` bit
+    /// (§5.4.2.24 — "the information in the bit stream is indicated as
+    /// protected by copyright").
+    pub fn is_copyright_protected(self) -> bool {
+        self.copyrightb
+    }
+
+    /// `true` when the encoder set the `origbs` bit (§5.4.2.25 —
+    /// "this is an original bit stream"). `false` indicates this is a
+    /// copy of another bitstream.
+    pub fn is_original_bitstream(self) -> bool {
+        self.origbs
+    }
+
+    /// Raw 1-bit `copyrightb` codepoint, useful for re-emission /
+    /// bit-exact mirroring of the wire field.
+    pub fn copyrightb_bit(self) -> u8 {
+        u8::from(self.copyrightb)
+    }
+
+    /// Raw 1-bit `origbs` codepoint, useful for re-emission /
+    /// bit-exact mirroring of the wire field.
+    pub fn origbs_bit(self) -> u8 {
+        u8::from(self.origbs)
+    }
+}
+
 /// Annex D §2.3.1.3-6 alternate-syntax mix-level codewords. Each is a
 /// 3-bit value; Tables D2.3 / D2.4 / D2.5 / D2.6 map them to linear
 /// gains via [`annex_d_lt_rt_clev`] / [`annex_d_lt_rt_slev`] /
@@ -917,8 +991,9 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         (None, None)
     };
 
-    let _copyrightb = br.read_u32(1)?;
-    let _origbs = br.read_u32(1)?;
+    let copyrightb = br.read_u32(1)? != 0;
+    let origbs = br.read_u32(1)? != 0;
+    let copyright_info = CopyrightInfo::from_bits(copyrightb, origbs);
 
     // §5.3.2 base syntax has `timecod1e/timecod2e` here; Annex D
     // §2.3 / Table D2.1 reuses the same two 1+14-bit slots as
@@ -1050,6 +1125,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         timecod1,
         timecod2,
         timecode_presence,
+        copyright_info,
         bits_consumed,
     })
 }
@@ -2437,5 +2513,172 @@ mod tests {
         assert!(b.dsurexmod.is_none());
         assert!(b.dheadphonmod.is_none());
         assert!(b.adconvtyp.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // CopyrightInfo — §5.4.2.24-25 distribution-control hint pair.
+    // ---------------------------------------------------------------
+
+    /// Walk all four `(copyrightb, origbs)` codepoints and assert the
+    /// raw 1-bit values + the semantic accessors line up with the spec
+    /// text (§5.4.2.24 / §5.4.2.25).
+    #[test]
+    fn copyright_info_four_codepoints_round_trip() {
+        let cases: [(bool, bool, bool, bool); 4] = [
+            (false, false, false, false),
+            (false, true, false, true),
+            (true, false, true, false),
+            (true, true, true, true),
+        ];
+        for (c, o, exp_protected, exp_original) in cases {
+            let ci = CopyrightInfo::from_bits(c, o);
+            assert_eq!(ci.is_copyright_protected(), exp_protected);
+            assert_eq!(ci.is_original_bitstream(), exp_original);
+            assert_eq!(ci.copyrightb_bit(), u8::from(c));
+            assert_eq!(ci.origbs_bit(), u8::from(o));
+        }
+    }
+
+    /// Equality + Copy semantics — two `CopyrightInfo` built from the
+    /// same bits compare equal, derive `Copy` so the typed surface can
+    /// be passed by value alongside the other small typed fields on
+    /// the BSI without ref-counting.
+    #[test]
+    fn copyright_info_eq_and_copy() {
+        let a = CopyrightInfo::from_bits(true, false);
+        let b = CopyrightInfo::from_bits(true, false);
+        let c = CopyrightInfo::from_bits(false, true);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        // Copy: `a` survives the `let _ = a;` use after the implicit move.
+        let moved = a;
+        assert_eq!(moved, a);
+    }
+
+    /// Parse a minimal 2/0 BSI with `copyrightb=0, origbs=1` (the
+    /// base-AC-3 encoder's default — "not protected, original
+    /// bitstream") and confirm the typed surface decodes the pair.
+    #[test]
+    fn parses_copyright_info_encoder_default() {
+        // 2/0 stereo, dialnorm=27. All metadata flags off. `copyrightb=0`,
+        // `origbs=1` matches the in-tree base-AC-3 encoder's emit.
+        let bits: &[(u8, u32)] = &[
+            (5, 8),  // bsid
+            (3, 0),  // bsmod
+            (3, 2),  // acmod
+            (2, 0),  // dsurmod
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 1),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 0),  // addbsie
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert!(!b.copyright_info.is_copyright_protected());
+        assert!(b.copyright_info.is_original_bitstream());
+        assert_eq!(b.copyright_info.copyrightb_bit(), 0);
+        assert_eq!(b.copyright_info.origbs_bit(), 1);
+    }
+
+    /// Parse a minimal 2/0 BSI with `copyrightb=1, origbs=0` (the
+    /// "protected copy" pattern — a downstream re-distribution should
+    /// honour the copyright tag and the "this is a copy" flag).
+    #[test]
+    fn parses_copyright_info_protected_copy() {
+        let bits: &[(u8, u32)] = &[
+            (5, 8),  // bsid
+            (3, 0),  // bsmod
+            (3, 2),  // acmod
+            (2, 0),  // dsurmod
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 1),  // copyrightb
+            (1, 0),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 0),  // addbsie
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert!(b.copyright_info.is_copyright_protected());
+        assert!(!b.copyright_info.is_original_bitstream());
+    }
+
+    /// Parse a 1+1 dual-mono BSI (acmod=0) and confirm `copyrightb` /
+    /// `origbs` decode correctly even when the 1+1 chain pushes the
+    /// pair further down the bit cursor (extra `dialnorm2` + Ch2
+    /// `compr2e` + `langcod2e` + `audprodi2e` flags sit between the
+    /// Ch1 metadata block and the `copyrightb`/`origbs` slots).
+    #[test]
+    fn parses_copyright_info_dual_mono_acmod_0() {
+        // acmod=0 (1+1). Ch1 metadata flags off, Ch2 metadata flags
+        // off, copyrightb=1, origbs=1.
+        let bits: &[(u8, u32)] = &[
+            (5, 8), // bsid
+            (3, 0), // bsmod
+            (3, 0), // acmod = 1+1
+            // cmixlev / surmixlev / dsurmod all absent for acmod=0.
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm (Ch1)
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            // 1+1 Ch2 service-metadata block
+            (5, 27), // dialnorm2
+            (1, 0),  // compr2e
+            (1, 0),  // langcod2e
+            (1, 0),  // audprodi2e
+            (1, 1),  // copyrightb
+            (1, 1),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 0),  // addbsie
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.acmod, 0);
+        assert!(b.copyright_info.is_copyright_protected());
+        assert!(b.copyright_info.is_original_bitstream());
+    }
+
+    /// Annex D `bsid == 6` keeps the same `copyrightb` / `origbs`
+    /// position in the BSI — only the post-`origbs` slots flip from
+    /// `timecod*e` to `xbsi*e`. Confirm the typed surface decodes
+    /// independently of the `bsid == 6` switch.
+    #[test]
+    fn parses_copyright_info_annex_d_bsid_6() {
+        // bsid=6, acmod=2 (2/0). xbsi1e=0, xbsi2e=0, copyrightb=0,
+        // origbs=0 — distinct from the base-syntax default to confirm
+        // the parser isn't reading a stale value.
+        let bits: &[(u8, u32)] = &[
+            (5, 6),  // bsid
+            (3, 0),  // bsmod
+            (3, 2),  // acmod
+            (2, 0),  // dsurmod
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 0),  // xbsi1e
+            (1, 0),  // xbsi2e
+            (1, 0),  // addbsie
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.bsid, 6);
+        assert!(!b.copyright_info.is_copyright_protected());
+        assert!(!b.copyright_info.is_original_bitstream());
     }
 }

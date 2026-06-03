@@ -148,7 +148,39 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       and `SecondHalfOnly` partial-presence rows, the `NotPresent`
       all-zero case, and the Annex D `bsid == 6` short-circuit that
       keeps `timecod1` / `timecod2` at `None` even when the wire bits
-      carrying `xbsi*e` are set). 196 lib tests, all green.
+      carrying `xbsi*e` are set). **Round 226** lifts the §5.4.2.24-25
+      distribution-control hint pair (`copyrightb` + `origbs`) from
+      parse-and-discard to a typed `Bsi::copyright_info: CopyrightInfo`
+      surface, mirrored on the Annex E `Bsi` as
+      `Option<CopyrightInfo>` (gated by `infomdate == 1` per
+      §E.2.3.1.62). The `CopyrightInfo` struct exposes
+      `is_copyright_protected()` (§5.4.2.24 — "the information in the
+      bit stream is indicated as protected by copyright") and
+      `is_original_bitstream()` (§5.4.2.25 — "this is an original bit
+      stream", `false` ⇒ this is a copy) accessors plus raw 1-bit
+      `copyrightb_bit()` / `origbs_bit()` getters for byte-exact
+      re-emission. The base-syntax pair is always present per §5.3.2 so
+      the field is unconditional `CopyrightInfo`; the Annex E pair sits
+      inside the §E.2.3.1.62 informational metadata block so the
+      surface is `Option<CopyrightInfo>` — `None` reflects the
+      encoder-default `infomdate == 0` path. Per spec the bits are
+      purely advisory ("does not affect the decoding process") so the
+      PCM path is unchanged; surfacing them lets a chain consumer
+      enforce a distribution / archival policy (refuse to re-encode a
+      `copyrightb == 1` stream, tag a `origbs == 0` copy for
+      downstream-only routing) without re-walking the BSI. The base
+      encoder still emits `copyrightb=0, origbs=1` and the Annex E
+      encoder still emits `infomdate=0` so encoder output is
+      byte-identical; the only behaviour change is decoder-side
+      parsing. Covered by 6 new `bsi::tests` (the four-codepoint
+      round-trip, `Eq` + `Copy` semantics, the encoder-default
+      `(0,1)` BSI parse, the `(1,0)` protected-copy pattern, the 1+1
+      dual-mono `acmod == 0` BSI where the pair sits further down the
+      cursor past the Ch2 metadata chain, and the Annex D `bsid == 6`
+      shared-position parse with `(0,0)`) plus 3 new
+      `eac3::bsi::tests` (`infomdate == 0` short-circuit; 3/2 indep
+      with `(1,1)`; 2/0 indep with `(0,0)` exercising the
+      `dheadphonmod` gate path). 205 lib tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

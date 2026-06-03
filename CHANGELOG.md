@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Distribution-control hint typed surface — `copyrightb` + `origbs`
+  pair (§5.4.2.24-25 / §E.2.3.1.62)** (round 226 / r226). The two
+  1-bit BSI flags the base + Annex E parsers used to consume-and-
+  discard now surface as a typed `CopyrightInfo` on the base AC-3
+  `Bsi` (always present per §5.3.2) and as an
+  `Option<CopyrightInfo>` on the Annex E `Bsi` (gated by
+  `infomdate == 1` since the pair lives inside the §E.2.3.1.62
+  informational-metadata block). `CopyrightInfo` exposes
+  `is_copyright_protected()` (§5.4.2.24), `is_original_bitstream()`
+  (§5.4.2.25), and raw `copyrightb_bit()` / `origbs_bit()` getters
+  for byte-exact re-emission. Per spec the bits are advisory and do
+  not influence the decoder PCM path; the typed surface lets a chain
+  consumer enforce a distribution / archival policy (refuse to
+  re-encode a `copyrightb == 1` stream, tag a `origbs == 0` copy for
+  downstream-only routing) without re-walking the BSI. The base
+  encoder still emits `copyrightb=0, origbs=1` and the Annex E
+  encoder still emits `infomdate=0` so encoder output is
+  byte-identical; the only behaviour change is decoder-side parsing.
+  Covered by 6 new `bsi::tests` (four-codepoint round-trip, `Eq` +
+  `Copy` semantics, the encoder-default `(0,1)` BSI parse, the
+  `(1,0)` protected-copy pattern, the 1+1 dual-mono `acmod == 0` BSI
+  where the pair sits further down the cursor, and the Annex D
+  `bsid == 6` shared-position parse with `(0,0)`) plus 3 new
+  `eac3::bsi::tests` (`infomdate == 0` short-circuit; 3/2 indep
+  `(1,1)`; 2/0 indep `(0,0)` exercising the `dheadphonmod` gate
+  path).
 - **Base-syntax timecode typed surface — `timecod1` / `timecod2` /
   `timecode_presence` (§5.4.2.26-28 / Table 5.13)** (round 219 / r219).
   The two 14-bit timecode fields the BSI parser used to consume-and-

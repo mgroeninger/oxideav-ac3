@@ -618,6 +618,7 @@ mod tests {
             timecod1: None,
             timecod2: None,
             timecode_presence: crate::bsi::TimeCodePresence::NotPresent,
+            copyright_info: crate::bsi::CopyrightInfo::from_bits(false, true),
             bits_consumed: 0,
         }
     }
@@ -652,6 +653,7 @@ mod tests {
             timecod1: None,
             timecod2: None,
             timecode_presence: crate::bsi::TimeCodePresence::NotPresent,
+            copyright_info: crate::bsi::CopyrightInfo::from_bits(false, true),
             bits_consumed: 0,
         }
     }

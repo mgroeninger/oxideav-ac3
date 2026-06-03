@@ -298,6 +298,7 @@ fn matrix_mapping_for_3_2_matches_spec() {
         timecod1: None,
         timecod2: None,
         timecode_presence: oxideav_ac3::bsi::TimeCodePresence::NotPresent,
+        copyright_info: oxideav_ac3::bsi::CopyrightInfo::from_bits(false, true),
         bits_consumed: 0,
     };
     let dmx = Downmix::from_bsi(&bsi, DownmixMode::Stereo);

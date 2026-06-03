@@ -55,8 +55,8 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
 use crate::bsi::{
-    AdConverterType, AnnexDMixLevels, AudioProductionInfo, CompressionGain, DolbyHeadphoneMode,
-    DolbySurroundExMode, RoomType,
+    AdConverterType, AnnexDMixLevels, AudioProductionInfo, CompressionGain, CopyrightInfo,
+    DolbyHeadphoneMode, DolbySurroundExMode, RoomType,
 };
 use crate::tables::acmod_nfchans;
 
@@ -219,6 +219,15 @@ pub struct Bsi {
     /// streams (`acmod == 0` AND `audprodi2e == 1`). `None` outside
     /// 1+1 mode or when the Ch2 production chain was absent.
     pub audio_production_ch2: Option<AudioProductionInfo>,
+    /// §E.2.3.1.62-65 distribution-control hint pair — same
+    /// `copyrightb` (§5.4.2.24) + `origbs` (§5.4.2.25) semantics as
+    /// base AC-3, sitting inside the informational-metadata block
+    /// gated by `infomdate == 1`. `None` when the encoder set
+    /// `infomdate == 0`. The decoder does not act on either bit; a
+    /// chain consumer can enforce a distribution / archival policy
+    /// without re-parsing the BSI. See [`crate::bsi::CopyrightInfo`]
+    /// for the typed surface.
+    pub copyright_info: Option<CopyrightInfo>,
     /// Frame size in bytes — `(frmsiz + 1) * 2`. Cached so the
     /// dispatcher can range-check the packet without re-doing
     /// arithmetic.
@@ -372,20 +381,28 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
 
     // §E.2.3.1.62 ff — informational meta-data.
     let infomdate = br.read_u32(1)? != 0;
-    let (dsurexmod, dheadphonmod, adconvtyp, adconvtyp_ch2, audio_production, audio_production_ch2) =
-        if infomdate {
-            let info = parse_informational_metadata(br, acmod, fscod, strmtyp, numblkscod)?;
-            (
-                info.dsurexmod,
-                info.dheadphonmod,
-                info.adconvtyp,
-                info.adconvtyp_ch2,
-                info.audio_production,
-                info.audio_production_ch2,
-            )
-        } else {
-            (None, None, None, None, None, None)
-        };
+    let (
+        dsurexmod,
+        dheadphonmod,
+        adconvtyp,
+        adconvtyp_ch2,
+        audio_production,
+        audio_production_ch2,
+        copyright_info,
+    ) = if infomdate {
+        let info = parse_informational_metadata(br, acmod, fscod, strmtyp, numblkscod)?;
+        (
+            info.dsurexmod,
+            info.dheadphonmod,
+            info.adconvtyp,
+            info.adconvtyp_ch2,
+            info.audio_production,
+            info.audio_production_ch2,
+            Some(info.copyright_info),
+        )
+    } else {
+        (None, None, None, None, None, None, None)
+    };
 
     // addbsi — opt-in trailer of up to 64 bytes.
     let addbsie = br.read_u32(1)? != 0;
@@ -424,6 +441,7 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         adconvtyp_ch2,
         audio_production,
         audio_production_ch2,
+        copyright_info,
         frame_bytes,
         bits_consumed,
     })
@@ -679,6 +697,7 @@ struct InformationalMetadata {
     adconvtyp_ch2: Option<AdConverterType>,
     audio_production: Option<AudioProductionInfo>,
     audio_production_ch2: Option<AudioProductionInfo>,
+    copyright_info: CopyrightInfo,
 }
 
 /// Walk the §E.2.3.1.62 ff informational metadata block. The body is
@@ -704,8 +723,9 @@ fn parse_informational_metadata(
     numblkscod: u8,
 ) -> Result<InformationalMetadata> {
     let _bsmod = br.read_u32(3)?;
-    let _copyrightb = br.read_u32(1)?;
-    let _origbs = br.read_u32(1)?;
+    let copyrightb = br.read_u32(1)? != 0;
+    let origbs = br.read_u32(1)? != 0;
+    let copyright_info = CopyrightInfo::from_bits(copyrightb, origbs);
     let dheadphonmod = if acmod == 0x2 {
         let _dsurmod = br.read_u32(2)?;
         let dhpm_raw = br.read_u32(2)? as u8;
@@ -776,6 +796,7 @@ fn parse_informational_metadata(
         adconvtyp_ch2,
         audio_production,
         audio_production_ch2,
+        copyright_info,
     })
 }
 
@@ -1411,5 +1432,114 @@ mod tests {
         let bsi = parse(&buf).unwrap();
         assert!(bsi.audio_production.is_none());
         assert!(bsi.audio_production_ch2.is_none());
+    }
+
+    /// `infomdate == 0` → the `copyrightb` / `origbs` pair is
+    /// definitionally absent from the wire (they live inside the
+    /// §E.2.3.1.62 informational metadata block, gated on
+    /// `infomdate == 1`). Surface must stay `None`.
+    #[test]
+    fn no_infomdate_yields_no_copyright_info() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = indep
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 2),    // acmod = 2/0
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // mixmdate
+            (1, 0),    // infomdate = 0
+            (1, 0),    // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert!(bsi.copyright_info.is_none());
+    }
+
+    /// `infomdate == 1` on a 3/2 indep frame surfaces the
+    /// `(copyrightb, origbs)` pair through `copyright_info`. Walk a
+    /// "protected, original" pattern (1, 1) to confirm both flags
+    /// land on the typed surface independently.
+    #[test]
+    fn infomdate_surfaces_copyright_info_protected_original_on_3_2() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = indep
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod = 48 kHz
+            (2, 3),    // numblkscod = 6 blocks
+            (3, 7),    // acmod = 7 (3/2)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // mixmdate
+            (1, 1),    // infomdate = 1
+            // info body — 3/2 with copyrightb=1, origbs=1:
+            (3, 0), // bsmod
+            (1, 1), // copyrightb
+            (1, 1), // origbs
+            // acmod >= 6 → dsurexmod present; acmod != 2 → no dheadphonmod
+            (2, 0), // dsurexmod
+            (1, 0), // audprodie = 0
+            // acmod != 0 → no audprodi2e
+            (1, 0), // sourcefscod
+            // strmtyp == Indep AND numblkscod == 3 → no convsync
+            (1, 0), // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        let ci = bsi
+            .copyright_info
+            .expect("infomdate=1 should surface copyright_info");
+        assert!(ci.is_copyright_protected());
+        assert!(ci.is_original_bitstream());
+        assert_eq!(ci.copyrightb_bit(), 1);
+        assert_eq!(ci.origbs_bit(), 1);
+    }
+
+    /// `infomdate == 1` on a 2/0 indep frame with the "unprotected
+    /// copy" pattern `(copyrightb=0, origbs=0)`. Distinct from the
+    /// 3/2 case above (different acmod, different bit layout after
+    /// `origbs`) so a single shared bit-cursor bug would surface as a
+    /// disagreement between the two tests.
+    #[test]
+    fn infomdate_surfaces_copyright_info_unprotected_copy_on_2_0() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod = 6 blocks
+            (3, 2),    // acmod = 2/0
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // mixmdate
+            (1, 1),    // infomdate = 1
+            (3, 0),    // bsmod
+            (1, 0),    // copyrightb
+            (1, 0),    // origbs
+            // acmod == 2 fires the dheadphonmod gate (consumes dsurmod+dhpm).
+            (2, 0), // dsurmod
+            (2, 0), // dheadphonmod
+            // acmod < 6 → no dsurexmod
+            (1, 0), // audprodie = 0
+            // acmod != 0 → no audprodi2e
+            (1, 0), // sourcefscod
+            (1, 0), // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        let ci = bsi
+            .copyright_info
+            .expect("infomdate=1 should surface copyright_info");
+        assert!(!ci.is_copyright_protected());
+        assert!(!ci.is_original_bitstream());
     }
 }

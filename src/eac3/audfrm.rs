@@ -636,6 +636,7 @@ mod tests {
             adconvtyp_ch2: None,
             audio_production: None,
             audio_production_ch2: None,
+            copyright_info: None,
             frame_bytes: 768,
             bits_consumed: 0,
         }
