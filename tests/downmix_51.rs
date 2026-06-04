@@ -283,6 +283,7 @@ fn matrix_mapping_for_3_2_matches_spec() {
         lfeon: false,
         nchans: 5,
         dialnorm: 27,
+        dialnorm_ch2: None,
         cmixlev: 0,
         surmixlev: 0,
         dsurmod: 0xFF,

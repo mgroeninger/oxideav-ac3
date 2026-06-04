@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dialogue-normalization typed surface — `DialNorm` over `dialnorm` /
+  `dialnorm2` (§5.4.2.8 / §5.4.2.16 / §7.6)** (round 234 / r234). The
+  5-bit `dialnorm` codepoint the BSI parser has long surfaced as a
+  remapped `u8` now also exposes a typed `DialNorm` view via
+  `Bsi::dialogue_normalization()`, mirrored on the Annex E `Bsi`. The
+  `DialNorm` newtype carries `codepoint()` (post-remap `1..=31`),
+  `wire_value()` (pre-remap, recovers the reserved `0`),
+  `is_reserved_wire_codepoint()`, `db() -> i8` (`-31..=-1` per
+  §5.4.2.8 "interpreted as -1 dB to -31 dB"),
+  `level_below_full_scale_db() -> u8` (`1..=31` — the §7.6 "headroom
+  in dB above the subjective dialogue level" phrasing),
+  `attenuation_linear() -> f32` (`10^(db/20)` linear scalar), and
+  `reproduction_gain_linear(listener_target_db, reference_full_scale_db)
+  -> f32` (the §7.6 playback-gain derivation:
+  `listener_target_db - reference_full_scale_db + level_below_full_scale_db`,
+  matching the spec's worked example exactly: listener 67 dB SPL +
+  reference 105 dB SPL + dialnorm -25 dB → -13 dB system attenuation
+  → full-scale digital reproduces at 92 dB SPL).
+  In parallel the parser lifts the §5.4.2.16 `dialnorm2` Ch2 mirror
+  for 1+1 dual-mono (`acmod == 0`) streams from parse-and-discard to a
+  new `Bsi::dialnorm_ch2: Option<u8>` field + matching
+  `Bsi::dialogue_normalization_ch2() -> Option<DialNorm>` typed
+  accessor, mirrored on the Annex E `Bsi`. Per §7.6 the value is not
+  applied inside the AC-3 decoder itself — it is forwarded to the
+  reproduction system's volume controller — so the PCM path is
+  unchanged. Encoders still emit `dialnorm == 27` (-27 dB) for every
+  syncframe and `dialnorm2 == 27` is unchanged in the 1+1 path so
+  encoder output is byte-identical; the only behaviour change is
+  decoder-side parsing. Covered by 9 new `bsi::tests` (every legal
+  `1..=31` wire codepoint round-trip, the reserved-`0`-remaps-to-`31`
+  path with the `is_reserved_wire_codepoint` flag, the low-5-bit-only
+  masking, linear attenuation at -1 / -25 / -31 dB,
+  the §7.6 worked-example reproduction-gain match, the typed accessor
+  via `parse()`, the 1+1 dual-mono `dialnorm_ch2` surface, the 1+1
+  Ch2 reserved-codepoint remap, and the non-1+1 `dialnorm_ch2.is_none()`
+  short-circuit) plus 4 new `eac3::bsi::tests` (the indep-substream
+  stereo typed-accessor round-trip, 1+1 Ch2 surface, Annex E reserved
+  codepoint remap, and the non-1+1 short-circuit).
 - **Distribution-control hint typed surface — `copyrightb` + `origbs`
   pair (§5.4.2.24-25 / §E.2.3.1.62)** (round 226 / r226). The two
   1-bit BSI flags the base + Annex E parsers used to consume-and-

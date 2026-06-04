@@ -180,7 +180,43 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       shared-position parse with `(0,0)`) plus 3 new
       `eac3::bsi::tests` (`infomdate == 0` short-circuit; 3/2 indep
       with `(1,1)`; 2/0 indep with `(0,0)` exercising the
-      `dheadphonmod` gate path). 205 lib tests, all green.
+      `dheadphonmod` gate path). **Round 234** lifts the §5.4.2.8
+      dialogue-normalization word from a remapped `u8` to a typed
+      `Bsi::dialogue_normalization() -> DialNorm` accessor (mirrored
+      on Annex E) and adds a parallel `Bsi::dialnorm_ch2: Option<u8>`
+      surface for the §5.4.2.16 Ch2 mirror in 1+1 dual-mono
+      (`acmod == 0`) streams plus
+      `Bsi::dialogue_normalization_ch2() -> Option<DialNorm>`. The
+      `DialNorm` newtype exposes `codepoint()` / `wire_value()` /
+      `is_reserved_wire_codepoint()` (so the §5.4.2.8 reserved-`0`
+      remap is observable), `db() -> i8` (`-31..=-1`),
+      `level_below_full_scale_db() -> u8` (`1..=31` — the §7.6
+      "headroom in dB above the subjective dialogue level"
+      phrasing), `attenuation_linear()`, and
+      `reproduction_gain_linear(listener_target_db,
+      reference_full_scale_db)` — the §7.6 playback-gain derivation
+      `listener_target_db − reference_full_scale_db +
+      level_below_full_scale_db` that lets a reproduction system
+      apply the dialnorm normalization without re-parsing the BSI.
+      Validated against the §7.6 worked example verbatim (listener
+      67 dB SPL, reference 105 dB SPL, dialnorm -25 dB → -13 dB
+      system gain → 92 dB SPL full-scale reproduction). Per §7.6
+      the value is not consumed inside the AC-3 decoder itself —
+      it is forwarded to the reproduction system's volume
+      controller — so the PCM path is unchanged. Encoders still
+      emit `dialnorm == 27` (-27 dB) so encoder output is
+      byte-identical; the only behaviour change is decoder-side
+      parsing. Covered by 9 new `bsi::tests` (every legal
+      `1..=31` wire codepoint round-trip, the reserved-`0` remap
+      observable via `is_reserved_wire_codepoint`, the
+      low-5-bit-only masking, linear attenuation at -1 / -25 / -31
+      dB, the §7.6 reproduction-gain worked example, the typed
+      accessor via `parse()`, 1+1 dual-mono `dialnorm_ch2`
+      surfacing, the Ch2 reserved-codepoint remap, and the
+      `acmod != 0` short-circuit) plus 4 new `eac3::bsi::tests`
+      (stereo indep surface, 1+1 Ch2 surface, Annex E reserved
+      codepoint remap, and the non-1+1 short-circuit). 218 lib
+      tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

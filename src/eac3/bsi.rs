@@ -56,7 +56,7 @@ use oxideav_core::{Error, Result};
 
 use crate::bsi::{
     AdConverterType, AnnexDMixLevels, AudioProductionInfo, CompressionGain, CopyrightInfo,
-    DolbyHeadphoneMode, DolbySurroundExMode, RoomType,
+    DialNorm, DolbyHeadphoneMode, DolbySurroundExMode, RoomType,
 };
 use crate::tables::acmod_nfchans;
 
@@ -140,8 +140,18 @@ pub struct Bsi {
     pub bsid: u8,
     /// Dialogue normalization, 1..=31 dB below reference. 0 in the
     /// stream is reserved → mapped to 31 per §5.4.2.8 (Annex E reuses
-    /// the base spec semantics).
+    /// the base spec semantics). For a typed surface exposing the
+    /// §7.6 reproduction-gain derivation, use
+    /// [`Self::dialogue_normalization`].
     pub dialnorm: u8,
+    /// §5.4.2.16 dialogue normalization for Ch2 in 1+1 dual-mono
+    /// Annex E streams (`acmod == 0`). `None` outside `acmod == 0`.
+    /// Same post-remap `1..=31` semantics as
+    /// [`Self::dialnorm`] (the `0` wire codepoint maps to `31`).
+    ///
+    /// For the typed surface, see
+    /// [`Self::dialogue_normalization_ch2`].
+    pub dialnorm_ch2: Option<u8>,
     /// `chanmap` field (16 bits, dependent substream only). `None`
     /// when `strmtyp != Dependent` or `chanmape == 0`.
     ///
@@ -235,6 +245,23 @@ pub struct Bsi {
     /// Total number of bits the parser consumed out of the input
     /// slice. Callers seek the audfrm parser to exactly this offset.
     pub bits_consumed: u64,
+}
+
+impl Bsi {
+    /// Typed view over [`Bsi::dialnorm`] per §5.4.2.8 (reused by
+    /// Annex E). Identical surface to
+    /// [`crate::bsi::Bsi::dialogue_normalization`] — see that
+    /// accessor for the §7.6 reproduction-gain derivation.
+    pub fn dialogue_normalization(&self) -> DialNorm {
+        DialNorm::from_wire(self.dialnorm)
+    }
+
+    /// Typed view over [`Bsi::dialnorm_ch2`] per §5.4.2.16 — the
+    /// Ch2 mirror in Annex E 1+1 dual-mono streams. `None` outside
+    /// `acmod == 0`.
+    pub fn dialogue_normalization_ch2(&self) -> Option<DialNorm> {
+        self.dialnorm_ch2.map(DialNorm::from_wire)
+    }
 }
 
 /// Parse the E-AC-3 BSI starting at byte 0 of `data` (the byte *just
@@ -347,16 +374,25 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
     };
 
     // 1+1 dual-mono (acmod == 0): second copy of dialnorm + compr.
-    let compr_ch2 = if acmod == 0 {
-        let _dialnorm2_raw = br.read_u32(5)?;
+    let (dialnorm_ch2, compr_ch2) = if acmod == 0 {
+        // §5.4.2.16 (reused by Annex E) — dialnorm2 has the same
+        // meaning as dialnorm; the `0` codepoint is reserved and
+        // remaps to `31` per §5.4.2.8.
+        let dialnorm2_raw = br.read_u32(5)? as u8;
+        let dialnorm2 = if dialnorm2_raw == 0 {
+            31
+        } else {
+            dialnorm2_raw
+        };
         let compr2e = br.read_u32(1)? != 0;
-        if compr2e {
+        let c2 = if compr2e {
             Some(CompressionGain::from_byte(br.read_u32(8)? as u8))
         } else {
             None
-        }
+        };
+        (Some(dialnorm2), c2)
     } else {
-        None
+        (None, None)
     };
 
     // §E.2.3.1.7-8 — chanmape / chanmap, dependent substream only.
@@ -429,6 +465,7 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         nchans,
         bsid,
         dialnorm,
+        dialnorm_ch2,
         chanmap,
         annex_e_mix_levels,
         dmixmod,
@@ -1541,5 +1578,145 @@ mod tests {
             .expect("infomdate=1 should surface copyright_info");
         assert!(!ci.is_copyright_protected());
         assert!(!ci.is_original_bitstream());
+    }
+
+    // ---------------------------------------------------------------
+    // §5.4.2.8 / §5.4.2.16 (reused) — Annex E dialogue-normalization
+    // typed surface.
+    // ---------------------------------------------------------------
+
+    /// On a stereo (acmod=2) indep substream the typed
+    /// `dialogue_normalization()` accessor returns a [`DialNorm`] over
+    /// the post-remap [`Bsi::dialnorm`] field, exposing `db()` and the
+    /// §7.6 reproduction-gain derivation. `acmod != 0` → no
+    /// `dialnorm_ch2`.
+    #[test]
+    fn parse_surfaces_dialogue_normalization_on_stereo_indep() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = independent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod = 3 (6 blocks)
+            (3, 2),    // acmod = 2 (2/0 stereo)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 20),   // dialnorm = -20 dB
+            (1, 0),    // compre
+            (1, 0),    // mixmdate
+            (1, 0),    // infomdate
+            (1, 0),    // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert_eq!(bsi.dialnorm, 20);
+        assert!(bsi.dialnorm_ch2.is_none());
+        let dn = bsi.dialogue_normalization();
+        assert_eq!(dn.codepoint(), 20);
+        assert_eq!(dn.db(), -20);
+        assert_eq!(dn.level_below_full_scale_db(), 20);
+        assert!(bsi.dialogue_normalization_ch2().is_none());
+    }
+
+    /// 1+1 dual-mono (acmod == 0) Annex E indep substream surfaces a
+    /// separate `dialnorm_ch2` per §5.4.2.16 ("This 5-bit code has the
+    /// same meaning as dialnorm, except that it applies to the second
+    /// audio channel"). The typed accessor mirrors the AC-3 base
+    /// surface.
+    #[test]
+    fn parse_surfaces_dialnorm_ch2_in_dual_mono() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 0),    // acmod = 0 (1+1 dual mono)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm (Ch1) = -27 dB
+            (1, 0),    // compre (Ch1) = 0
+            (5, 11),   // dialnorm2 (Ch2) = -11 dB
+            (1, 0),    // compr2e
+            (1, 0),    // mixmdate
+            (1, 0),    // infomdate
+            (1, 0),    // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert_eq!(bsi.acmod, 0);
+        assert_eq!(bsi.dialnorm, 27);
+        let dn_ch2_raw = bsi
+            .dialnorm_ch2
+            .expect("acmod == 0 should surface dialnorm_ch2");
+        assert_eq!(dn_ch2_raw, 11);
+        let typed = bsi
+            .dialogue_normalization_ch2()
+            .expect("dialnorm_ch2 surfaced");
+        assert_eq!(typed.codepoint(), 11);
+        assert_eq!(typed.db(), -11);
+        // Ch1 surface is independent.
+        assert_eq!(bsi.dialogue_normalization().db(), -27);
+    }
+
+    /// Annex E reuses §5.4.2.8 reserved-codepoint semantics for
+    /// `dialnorm2` per §5.4.2.16 ("This 5-bit code has the same meaning
+    /// as dialnorm"): wire `0` remaps to `31`. The parser stores the
+    /// post-remap value on `dialnorm_ch2`.
+    #[test]
+    fn parse_remaps_dialnorm2_zero_codepoint_to_31_annex_e() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),
+            (3, 0),
+            (11, 383),
+            (2, 0),
+            (2, 3),
+            (3, 0), // acmod = 0
+            (1, 0),
+            (5, 16),
+            (5, 27), // dialnorm = -27 dB
+            (1, 0),  // compre
+            (5, 0),  // dialnorm2 = reserved 0 → remaps to 31
+            (1, 0),  // compr2e
+            (1, 0),  // mixmdate
+            (1, 0),  // infomdate
+            (1, 0),  // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        let dn_ch2_raw = bsi.dialnorm_ch2.expect("acmod == 0");
+        assert_eq!(dn_ch2_raw, 31);
+        let typed = bsi
+            .dialogue_normalization_ch2()
+            .expect("dialnorm_ch2 surfaced");
+        assert_eq!(typed.codepoint(), 31);
+        assert_eq!(typed.db(), -31);
+    }
+
+    /// Non-1+1 Annex E streams (`acmod != 0`) never carry `dialnorm2`
+    /// — the `dialnorm_ch2` field stays `None`. Mirrors the AC-3 base
+    /// short-circuit.
+    #[test]
+    fn parse_leaves_dialnorm_ch2_none_outside_dual_mono_annex_e() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),
+            (3, 0),
+            (11, 383),
+            (2, 0),
+            (2, 3),
+            (3, 7), // acmod = 7 (3/2 5.0)
+            (1, 0), // lfeon
+            (5, 16),
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // mixmdate
+            (1, 0),  // infomdate
+            (1, 0),  // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert_eq!(bsi.acmod, 7);
+        assert!(bsi.dialnorm_ch2.is_none());
+        assert!(bsi.dialogue_normalization_ch2().is_none());
     }
 }

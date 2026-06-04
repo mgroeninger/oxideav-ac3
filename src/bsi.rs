@@ -43,8 +43,22 @@ pub struct Bsi {
     /// Total channel count — `nfchans + lfeon`.
     pub nchans: u8,
     /// Dialogue normalization, 1..=31 dB below reference. 0 is reserved
-    /// and spec says to treat it as 31.
+    /// and spec says to treat it as 31. For a typed surface that
+    /// exposes the `1..=31`-dB-below-reference semantics + the §7.6
+    /// reproduction-gain derivation, use
+    /// [`Bsi::dialogue_normalization`].
     pub dialnorm: u8,
+    /// §5.4.2.16 dialogue normalization for Ch2 in 1+1 dual-mono
+    /// streams (`acmod == 0`). `None` outside `acmod == 0`. Stored as
+    /// the same post-remap `1..=31` codepoint that
+    /// [`Bsi::dialnorm`] carries — the reserved `0` wire codepoint
+    /// is collapsed to `31` per §5.4.2.8 (the spec note on
+    /// §5.4.2.16 reads "This 5-bit code has the same meaning as
+    /// dialnorm").
+    ///
+    /// For the typed surface, see
+    /// [`Bsi::dialogue_normalization_ch2`].
+    pub dialnorm_ch2: Option<u8>,
     /// Center mix-level coefficient code (cmixlev) for acmod with 3
     /// front channels; 0xFF when absent.
     pub cmixlev: u8,
@@ -165,6 +179,29 @@ impl Bsi {
     pub fn service_type(&self) -> BitStreamMode {
         BitStreamMode::from_bsmod_acmod(self.bsmod, self.acmod)
     }
+
+    /// Typed view over [`Bsi::dialnorm`] per §5.4.2.8. The wrapper
+    /// exposes both `db()` (signed, in `-31..=-1` dB) and
+    /// `reproduction_gain_linear()` (the §7.6 playback-gain
+    /// derivation) so a reproduction system can apply the dialnorm
+    /// without re-parsing the BSI.
+    ///
+    /// Because [`Bsi::dialnorm`] has already been remapped (the
+    /// reserved `0` codepoint becomes `31`), the returned
+    /// [`DialNorm::is_reserved_wire_codepoint`] always reports
+    /// `false` on the value built from this accessor — callers who
+    /// need to detect the reserved-wire-code path should consult the
+    /// raw [`Bsi::dialnorm`] value directly.
+    pub fn dialogue_normalization(&self) -> DialNorm {
+        DialNorm::from_wire(self.dialnorm)
+    }
+
+    /// Typed view over [`Bsi::dialnorm_ch2`] per §5.4.2.16 — the
+    /// Ch2 mirror in 1+1 dual-mono streams. `None` outside
+    /// `acmod == 0`.
+    pub fn dialogue_normalization_ch2(&self) -> Option<DialNorm> {
+        self.dialnorm_ch2.map(DialNorm::from_wire)
+    }
 }
 
 /// Service-type classification of an AC-3 bit stream — Table 5.7
@@ -276,6 +313,168 @@ impl BitStreamMode {
             BitStreamMode::Karaoke => "K",
             BitStreamMode::Reserved => "?",
         }
+    }
+}
+
+/// §5.4.2.8 dialogue normalization word — the 5-bit `dialnorm`
+/// codepoint, lifted into a typed surface.
+///
+/// Per spec the 5-bit value indicates "how far the average dialogue
+/// level is below digital 100 percent": valid codepoints `1..=31`
+/// map to `-1 dB`..=`-31 dB`. The `0` codepoint is reserved; a
+/// spec-compliant decoder treats it as `31` (the `-31 dB` floor).
+///
+/// Per §7.6 the `dialnorm` value is **not** consumed inside the
+/// AC-3 decoder itself — it is forwarded to the reproduction
+/// system's volume controller, which combines it with the
+/// listener's chosen playback SPL. With `dialnorm` advertised, a
+/// system volume control calibrated in dB SPL stays consistent
+/// across programs of different mixing loudness (the spec example
+/// describes a listener set to 67 dB SPL receiving a -25 dB
+/// program then a -15 dB commercial — the system gain
+/// auto-adjusts so the dialogue stays at 67 dB SPL across the
+/// boundary). The §7.6 prose closes with "It is mandatory that
+/// the dialnorm value and the user selected volume setting both
+/// be used to set the reproduction system gain."
+///
+/// `oxideav-ac3`'s decoder PCM path does not apply the value
+/// (the field is forwarded raw on [`crate::bsi::Bsi::dialnorm`])
+/// — surfacing the typed value lets a downstream volume
+/// controller carry out the §7.6 normalisation without
+/// re-parsing the BSI.
+///
+/// For 1+1 dual-mono streams (`acmod == 0`) the bitstream carries
+/// a second copy of the word for Ch2; see
+/// [`crate::bsi::Bsi::dialnorm_ch2`] / [`Bsi::dialogue_normalization_ch2`]
+/// for that surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DialNorm {
+    /// Stored as the post-remap codepoint in `1..=31`. The `0`
+    /// wire codepoint is collapsed to `31` per §5.4.2.8; the
+    /// `wire_value` accessor recovers the on-the-wire byte if
+    /// needed.
+    raw: u8,
+    /// Records whether the on-the-wire codepoint was the reserved
+    /// `0` value (which the parser remaps to `31`). Lets a
+    /// careful consumer distinguish "encoder emitted the
+    /// reserved code" from a legitimate `31` codepoint.
+    was_reserved: bool,
+}
+
+impl DialNorm {
+    /// Wrap a 5-bit wire codepoint. The reserved `0` codepoint is
+    /// remapped to `31` per §5.4.2.8; the original wire value is
+    /// preserved for [`Self::wire_value`] and
+    /// [`Self::is_reserved_wire_codepoint`].
+    ///
+    /// Only the low 5 bits of `wire` are consulted.
+    pub fn from_wire(wire: u8) -> Self {
+        let masked = wire & 0x1F;
+        if masked == 0 {
+            Self {
+                raw: 31,
+                was_reserved: true,
+            }
+        } else {
+            Self {
+                raw: masked,
+                was_reserved: false,
+            }
+        }
+    }
+
+    /// Post-remap codepoint in `1..=31`. This is the value the
+    /// reproduction system should use for §7.6 normalisation —
+    /// the reserved `0` wire codepoint has already been collapsed
+    /// to `31`.
+    pub fn codepoint(self) -> u8 {
+        self.raw
+    }
+
+    /// On-the-wire 5-bit codepoint as it appeared in the
+    /// bitstream (`0..=31`). Recovers `0` for the reserved code;
+    /// callers re-emitting the BSI byte-for-byte should use this
+    /// rather than [`Self::codepoint`].
+    pub fn wire_value(self) -> u8 {
+        if self.was_reserved {
+            0
+        } else {
+            self.raw
+        }
+    }
+
+    /// `true` when the on-the-wire codepoint was the reserved
+    /// `0` value (which the parser remapped to `31` per
+    /// §5.4.2.8). Use to flag malformed encoders without
+    /// rejecting the stream — per the spec text "If the reserved
+    /// value of 0 is received, the decoder shall use -31 dB."
+    pub fn is_reserved_wire_codepoint(self) -> bool {
+        self.was_reserved
+    }
+
+    /// Dialogue level below digital 100 percent, in dB. Returns
+    /// a negative integer in `-31..=-1` per §5.4.2.8 (the spec's
+    /// "interpreted as -1 dB to -31 dB" wording — codepoint `N`
+    /// maps to `-N dB`).
+    pub fn db(self) -> i8 {
+        -(self.raw as i8)
+    }
+
+    /// Magnitude of the dialogue level below full scale, in dB
+    /// (`1..=31`). Equivalent to `-self.db()` — kept as a
+    /// separate accessor since the §7.6 prose phrases the value
+    /// both ways ("headroom in dB above the subjective dialogue
+    /// level" / "how many dB the subjective dialogue level is
+    /// below digital 100 percent").
+    pub fn level_below_full_scale_db(self) -> u8 {
+        self.raw
+    }
+
+    /// Linear-domain attenuation factor — multiply a full-scale
+    /// digital signal by this to land at the dialogue reference
+    /// level. Equivalent to `10^(dialnorm.db() / 20.0)`. Range:
+    /// `10^(-31/20) ≈ 0.0282` at codepoint 31 (the `-31 dB`
+    /// floor) up to `10^(-1/20) ≈ 0.891` at codepoint 1
+    /// (the `-1 dB` ceiling).
+    ///
+    /// This is the *reverse* of the gain the reproduction system
+    /// applies — the spec mandates the system *boost* the signal
+    /// by `(listener_target_db + dialnorm.db()) dB`, not attenuate
+    /// it by `-dialnorm.db() dB`. Use
+    /// [`Self::reproduction_gain_linear`] for the playback gain
+    /// derivation.
+    pub fn attenuation_linear(self) -> f32 {
+        10.0f32.powf(self.db() as f32 / 20.0)
+    }
+
+    /// Linear playback gain to bring dialogue at the encoded
+    /// level to the listener's target dialogue SPL — per §7.6
+    /// "reproduction system gain becomes a function of both the
+    /// listeners desired reproduction sound pressure level for
+    /// dialogue, and the dialnorm value".
+    ///
+    /// Given a listener target dialogue level (in dB SPL) and an
+    /// assumed full-scale reproduction SPL (`reference_full_scale_db`),
+    /// the playback gain in dB is
+    /// `listener_target_db - (reference_full_scale_db + self.db())`
+    /// — equivalent to
+    /// `listener_target_db - reference_full_scale_db + level_below_full_scale_db`.
+    /// Returned as a linear multiplier.
+    ///
+    /// Example (from §7.6): `listener_target_db = 67`,
+    /// `reference_full_scale_db = 105` (typical cinema
+    /// calibration), `level_below_full_scale_db = 25` →
+    /// `67 - 105 + 25 = -13 dB` of attenuation from full scale,
+    /// matching the spec example's "full scale digital signals
+    /// reproduce at a sound pressure level of 92 dB".
+    pub fn reproduction_gain_linear(
+        self,
+        listener_target_db: f32,
+        reference_full_scale_db: f32,
+    ) -> f32 {
+        let gain_db =
+            listener_target_db - reference_full_scale_db + self.level_below_full_scale_db() as f32;
+        10.0f32.powf(gain_db / 20.0)
     }
 }
 
@@ -963,8 +1162,15 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     };
 
     // 1+1 mode (dual mono) carries a second copy of the metadata for Ch2.
-    let (compr_ch2, audio_production_ch2) = if acmod == 0 {
-        let _dialnorm2 = br.read_u32(5)?;
+    let (dialnorm_ch2, compr_ch2, audio_production_ch2) = if acmod == 0 {
+        // §5.4.2.16 — dialnorm2 has the same meaning as dialnorm; the
+        // `0` codepoint is reserved and remaps to `31` per §5.4.2.8.
+        let dialnorm2_raw = br.read_u32(5)? as u8;
+        let dialnorm2 = if dialnorm2_raw == 0 {
+            31
+        } else {
+            dialnorm2_raw
+        };
         let compr2e = br.read_u32(1)? != 0;
         let c2 = if compr2e {
             Some(CompressionGain::from_byte(br.read_u32(8)? as u8))
@@ -986,9 +1192,9 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         } else {
             None
         };
-        (c2, ap2)
+        (Some(dialnorm2), c2, ap2)
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let copyrightb = br.read_u32(1)? != 0;
@@ -1110,6 +1316,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         lfeon,
         nchans,
         dialnorm,
+        dialnorm_ch2,
         cmixlev,
         surmixlev,
         dsurmod,
@@ -1872,6 +2079,245 @@ mod tests {
         let c2 = bsi.compr_ch2.expect("compr2e=1");
         assert_eq!(c2.raw(), 0b1000_0000);
         assert!((c2.decibels() - (-48.165)).abs() < 0.01);
+    }
+
+    // ---------------------------------------------------------------
+    // §5.4.2.8 / §5.4.2.16 — dialogue normalization typed surface.
+    // ---------------------------------------------------------------
+
+    /// Every legal wire codepoint `1..=31` maps to itself unchanged
+    /// and to `-N dB` per §5.4.2.8 ("interpreted as -1 dB to -31 dB").
+    #[test]
+    fn dialnorm_decodes_every_legal_wire_codepoint() {
+        for wire in 1u8..=31u8 {
+            let dn = DialNorm::from_wire(wire);
+            assert_eq!(dn.codepoint(), wire);
+            assert_eq!(dn.wire_value(), wire);
+            assert!(!dn.is_reserved_wire_codepoint());
+            assert_eq!(dn.db(), -(wire as i8));
+            assert_eq!(dn.level_below_full_scale_db(), wire);
+        }
+    }
+
+    /// The reserved `0` wire codepoint remaps to `31` per §5.4.2.8
+    /// ("If the reserved value of 0 is received, the decoder shall
+    /// use -31 dB"). The remap is observable via
+    /// [`DialNorm::is_reserved_wire_codepoint`] so a careful consumer
+    /// can distinguish a legitimate `31` codepoint from the reserved-
+    /// remap path; [`DialNorm::wire_value`] recovers the original `0`
+    /// for byte-exact re-emission.
+    #[test]
+    fn dialnorm_zero_wire_codepoint_remaps_to_31_with_reserved_flag() {
+        let dn = DialNorm::from_wire(0);
+        assert_eq!(dn.codepoint(), 31);
+        assert_eq!(dn.wire_value(), 0);
+        assert!(dn.is_reserved_wire_codepoint());
+        assert_eq!(dn.db(), -31);
+        assert_eq!(dn.level_below_full_scale_db(), 31);
+        // A "real" 31 codepoint reports the same dB / codepoint but is
+        // distinguishable from the reserved path.
+        let dn31 = DialNorm::from_wire(31);
+        assert_eq!(dn31.codepoint(), 31);
+        assert_eq!(dn31.wire_value(), 31);
+        assert!(!dn31.is_reserved_wire_codepoint());
+        assert_ne!(dn, dn31);
+    }
+
+    /// Bits above the 5-bit field are masked off — `from_wire` consumes
+    /// only the low 5 bits per the BSI bit-reader contract.
+    #[test]
+    fn dialnorm_only_consumes_low_5_bits() {
+        let dn = DialNorm::from_wire(0b1110_1011); // low5=01011=11
+        assert_eq!(dn.codepoint(), 11);
+        assert_eq!(dn.db(), -11);
+    }
+
+    /// Linear attenuation matches `10^(dB/20)` per the standard
+    /// dB-to-linear conversion. `-1 dB` ≈ 0.8913, `-31 dB` ≈ 0.02818,
+    /// `-25 dB` ≈ 0.05623.
+    #[test]
+    fn dialnorm_attenuation_linear_matches_dbgain() {
+        let cases: [(u8, f32); 3] = [(1, 0.8913), (25, 0.0562), (31, 0.0282)];
+        for (wire, expected) in cases {
+            let got = DialNorm::from_wire(wire).attenuation_linear();
+            assert!(
+                (got - expected).abs() < 1e-3,
+                "wire={wire}: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    /// §7.6 worked example — listener target 67 dB SPL, reference
+    /// full-scale 105 dB SPL, dialnorm = -25 dB → playback gain
+    /// `67 - 105 + 25 = -13 dB` (so full-scale digital reproduces at
+    /// `105 - 13 = 92 dB SPL`, matching the spec text "full scale
+    /// digital signals reproduce at a sound pressure level of 92 dB").
+    /// Linear gain `10^(-13/20) ≈ 0.2239`.
+    #[test]
+    fn dialnorm_reproduction_gain_matches_spec_7_6_example() {
+        let dn = DialNorm::from_wire(25);
+        let gain = dn.reproduction_gain_linear(67.0, 105.0);
+        let expected = 10.0f32.powf(-13.0 / 20.0);
+        assert!(
+            (gain - expected).abs() < 1e-4,
+            "got {gain}, expected {expected}"
+        );
+    }
+
+    /// `parse()` surfaces [`Bsi::dialnorm`] as the post-remap u8 (kept
+    /// for backward compatibility) AND exposes the typed
+    /// [`Bsi::dialogue_normalization`] accessor. The typed view loses
+    /// the reserved-wire-codepoint distinction since the post-remap
+    /// `dialnorm` field has already collapsed it; callers needing the
+    /// raw codepoint check the field directly.
+    #[test]
+    fn parse_surfaces_dialogue_normalization_accessor() {
+        // 2/0 stereo, dialnorm=20, all optional metadata off.
+        let bits: [(u8, u32); 14] = [
+            (5, 8),  // bsid
+            (3, 0),  // bsmod
+            (3, 2),  // acmod=2 (2/0 stereo)
+            (2, 0),  // dsurmod
+            (1, 0),  // lfeon
+            (5, 20), // dialnorm = -20 dB
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 0),  // addbsie
+        ];
+        let mut bytes = pack_bits(&bits);
+        bytes.push(0);
+        let bsi = parse(&bytes).unwrap();
+        assert_eq!(bsi.dialnorm, 20);
+        assert!(bsi.dialnorm_ch2.is_none());
+        let dn = bsi.dialogue_normalization();
+        assert_eq!(dn.codepoint(), 20);
+        assert_eq!(dn.db(), -20);
+        assert_eq!(dn.level_below_full_scale_db(), 20);
+        assert!(bsi.dialogue_normalization_ch2().is_none());
+    }
+
+    /// 1+1 dual-mono (`acmod == 0`) carries a second `dialnorm2` word
+    /// for Ch2 with identical §5.4.2.8 semantics per §5.4.2.16
+    /// ("This 5-bit code has the same meaning as dialnorm"). Build a
+    /// 1+1 BSI with Ch1 dialnorm=27 (-27 dB) and Ch2 dialnorm2=11
+    /// (-11 dB) and verify both surface independently — Ch2 via the
+    /// new `dialnorm_ch2` field + `dialogue_normalization_ch2()`
+    /// accessor.
+    #[test]
+    fn parse_surfaces_dialnorm_ch2_in_dual_mono() {
+        let bits: [(u8, u32); 18] = [
+            (5, 8),
+            (3, 0),
+            (3, 0),  // acmod=0 (1+1 dual mono)
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm = -27 dB
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (5, 11), // dialnorm2 = -11 dB
+            (1, 0),  // compr2e
+            (1, 0),  // langcod2e
+            (1, 0),  // audprodi2e
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 0),  // addbsie
+            (1, 0),  // pad
+        ];
+        let mut bytes = pack_bits(&bits);
+        bytes.push(0);
+        let bsi = parse(&bytes).unwrap();
+        assert_eq!(bsi.acmod, 0);
+        assert_eq!(bsi.dialnorm, 27);
+        let dn_ch2 = bsi
+            .dialnorm_ch2
+            .expect("acmod == 0 should surface dialnorm_ch2");
+        assert_eq!(dn_ch2, 11);
+        let typed = bsi
+            .dialogue_normalization_ch2()
+            .expect("dialnorm_ch2 surfaced");
+        assert_eq!(typed.codepoint(), 11);
+        assert_eq!(typed.db(), -11);
+        // Ch1 surface is independent.
+        assert_eq!(bsi.dialogue_normalization().codepoint(), 27);
+    }
+
+    /// 1+1 dual-mono Ch2 with the reserved `dialnorm2 = 0` wire
+    /// codepoint remaps to `31` per §5.4.2.8 (reused by §5.4.2.16),
+    /// matching the Ch1 remap. The post-remap `31` is what the parser
+    /// stores; the wire-reserved-bit distinction is only available
+    /// via `DialNorm::from_wire(0)` on a freshly built value, not via
+    /// the BSI surface (since the BSI field is the remapped value
+    /// only — same shape as Ch1's existing `dialnorm: u8`).
+    #[test]
+    fn parse_remaps_dialnorm2_zero_codepoint_to_31() {
+        let bits: [(u8, u32); 18] = [
+            (5, 8),
+            (3, 0),
+            (3, 0), // acmod=0
+            (1, 0),
+            (5, 27), // dialnorm = -27 dB (legitimate)
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (5, 0),  // dialnorm2 = reserved 0 → remaps to 31
+            (1, 0),  // compr2e
+            (1, 0),  // langcod2e
+            (1, 0),  // audprodi2e
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 0),  // addbsie
+            (1, 0),
+        ];
+        let mut bytes = pack_bits(&bits);
+        bytes.push(0);
+        let bsi = parse(&bytes).unwrap();
+        let dn_ch2 = bsi.dialnorm_ch2.expect("acmod == 0");
+        assert_eq!(dn_ch2, 31);
+        let typed = bsi
+            .dialogue_normalization_ch2()
+            .expect("dialnorm_ch2 surfaced");
+        assert_eq!(typed.codepoint(), 31);
+        assert_eq!(typed.db(), -31);
+    }
+
+    /// Non-1+1 streams (`acmod != 0`) never carry `dialnorm2` per
+    /// §5.4.2.16's "applies to the second audio channel when acmod
+    /// indicates two independent channels (dual mono 1+1 mode)". The
+    /// `dialnorm_ch2` field stays `None` for every other `acmod`.
+    #[test]
+    fn parse_leaves_dialnorm_ch2_none_outside_dual_mono() {
+        // 2/0 stereo (acmod=2) baseline.
+        let bits: [(u8, u32); 14] = [
+            (5, 8),
+            (3, 0),
+            (3, 2), // acmod=2
+            (2, 0), // dsurmod
+            (1, 0), // lfeon
+            (5, 27),
+            (1, 0), // compre
+            (1, 0), // langcode
+            (1, 0), // audprodie
+            (1, 0), // copyrightb
+            (1, 0), // origbs
+            (1, 0), // timecod1e
+            (1, 0), // timecod2e
+            (1, 0), // addbsie
+        ];
+        let mut bytes = pack_bits(&bits);
+        bytes.push(0);
+        let bsi = parse(&bytes).unwrap();
+        assert_eq!(bsi.acmod, 2);
+        assert!(bsi.dialnorm_ch2.is_none());
+        assert!(bsi.dialogue_normalization_ch2().is_none());
     }
 
     // ---------------------------------------------------------------

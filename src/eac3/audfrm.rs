@@ -624,6 +624,7 @@ mod tests {
             nchans: crate::tables::acmod_nfchans(acmod) + u8::from(lfeon),
             bsid: 16,
             dialnorm: 27,
+            dialnorm_ch2: None,
             chanmap: None,
             annex_e_mix_levels: None,
             dmixmod: 0xFF,
