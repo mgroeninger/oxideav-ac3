@@ -57,6 +57,7 @@ use oxideav_core::{Error, Result};
 use crate::bsi::{
     AdConverterType, AdditionalBitStreamInfo, AnnexDMixLevels, AudioProductionInfo,
     CompressionGain, CopyrightInfo, DialNorm, DolbyHeadphoneMode, DolbySurroundExMode, RoomType,
+    StereoDownmixPreference,
 };
 use crate::tables::acmod_nfchans;
 
@@ -178,6 +179,21 @@ pub struct Bsi {
     /// preferred, `11` = reserved). `0xFF` when `mixmdate == 0` or the
     /// `acmod > 2` guard fires.
     pub dmixmod: u8,
+    /// Annex E mixmdata preferred stereo downmix mode (Table E1.2
+    /// §E.1.2.2 reusing Annex D §2.3.1.2 / Table D2.2), surfaced as a
+    /// typed [`StereoDownmixPreference`]. `Some` only when
+    /// `mixmdate == 1` AND `acmod > 2`; `None` otherwise (the
+    /// per-Table-E1.2 guard skips the 2-bit slot for mono / 2/0
+    /// streams, and a `mixmdate == 0` syncframe carries no mixing
+    /// metadata at all). Equivalent to the typed view of
+    /// [`Bsi::dmixmod`] where the `0xFF` "absent" sentinel becomes
+    /// `None`; the raw field stays authoritative for bit-stream
+    /// round-trip and the typed surface is a thin convenience over
+    /// it. Lets a §3.1.1 auto-mode two-channel-downmix router pick
+    /// LtRt vs LoRo without consulting a magic-number sentinel —
+    /// shared with the base-syntax [`crate::bsi::Bsi::dmixmod_preference`]
+    /// so a single chain consumer can handle both syntaxes.
+    pub dmixmod_preference: Option<StereoDownmixPreference>,
     /// Annex E mixmdata LFE mix level (`lfemixlevcod`, 5 bits, §E.1.2.2).
     /// `Some` when `lfeon == 1`, `mixmdate == 1`, and `lfemixlevcode == 1`;
     /// `None` otherwise. The 5-bit code is **not** consulted by the
@@ -268,6 +284,17 @@ impl Bsi {
     /// `acmod == 0`.
     pub fn dialogue_normalization_ch2(&self) -> Option<DialNorm> {
         self.dialnorm_ch2.map(DialNorm::from_wire)
+    }
+
+    /// Typed view over [`Bsi::dmixmod_preference`] — the Annex E
+    /// mixmdata preferred stereo downmix mode (Table E1.2 §E.1.2.2
+    /// reusing Annex D §2.3.1.2 / Table D2.2). `Some` only when
+    /// `mixmdate == 1` AND `acmod > 2`; `None` otherwise. Identical
+    /// surface to [`crate::bsi::Bsi::stereo_downmix_preference`] so
+    /// a §3.1.1 auto-mode two-channel-downmix router can be shared
+    /// between the base AC-3 and Annex E paths.
+    pub fn stereo_downmix_preference(&self) -> Option<StereoDownmixPreference> {
+        self.dmixmod_preference
     }
 }
 
@@ -416,10 +443,10 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
 
     // §E.2.3.1.9-21 — mixing meta-data block.
     let mixmdate = br.read_u32(1)? != 0;
-    let (annex_e_mix_levels, dmixmod, lfemixlevcod) = if mixmdate {
+    let (annex_e_mix_levels, dmixmod, dmixmod_preference, lfemixlevcod) = if mixmdate {
         parse_mixing_metadata(br, acmod, lfeon, strmtyp, numblkscod)?
     } else {
-        (None, 0xFFu8, None)
+        (None, 0xFFu8, None, None)
     };
 
     // §E.2.3.1.62 ff — informational meta-data.
@@ -487,6 +514,7 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         chanmap,
         annex_e_mix_levels,
         dmixmod,
+        dmixmod_preference,
         lfemixlevcod,
         compr,
         compr_ch2,
@@ -523,19 +551,27 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
 /// `None` only when none of the four center/surround fields were
 /// present (mono / 2/0 stereo with no surrounds) — those layouts have
 /// no downmix to refine.
+type MixingMetadata = (
+    Option<AnnexDMixLevels>,
+    u8,
+    Option<StereoDownmixPreference>,
+    Option<u8>,
+);
+
 fn parse_mixing_metadata(
     br: &mut BitReader<'_>,
     acmod: u8,
     lfeon: bool,
     strmtyp: StreamType,
     numblkscod: u8,
-) -> Result<(Option<AnnexDMixLevels>, u8, Option<u8>)> {
+) -> Result<MixingMetadata> {
     // §E.2.3.1 mixing metadata — Table E1.2.
     // dmixmod (2) when acmod > 0x2 (more than 2 channels).
-    let dmixmod = if acmod > 0x2 {
-        br.read_u32(2)? as u8
+    let (dmixmod, dmixmod_preference) = if acmod > 0x2 {
+        let raw = br.read_u32(2)? as u8;
+        (raw, Some(StereoDownmixPreference::from_code(raw)))
     } else {
-        0xFFu8
+        (0xFFu8, None)
     };
     // ltrtcmixlev (3) + lorocmixlev (3) when 3 front channels exist.
     let (ltrtcmixlev, lorocmixlev) = if (acmod & 0x1) != 0 && acmod > 0x2 {
@@ -671,7 +707,12 @@ fn parse_mixing_metadata(
             }
         }
     }
-    Ok((annex_e_mix_levels, dmixmod, lfemixlevcod))
+    Ok((
+        annex_e_mix_levels,
+        dmixmod,
+        dmixmod_preference,
+        lfemixlevcod,
+    ))
 }
 
 /// Parses the body of `mixdata2e` (mixing option 4 with extra channel
@@ -1840,6 +1881,114 @@ mod tests {
         assert_eq!(bsi.strmtyp, StreamType::Dependent);
         let info = bsi.addbsi.expect("addbsie == 1 surfaces a payload");
         assert_eq!(info.payload(), &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    /// Round 243 — Annex E mixmdata (§E.1.2.2 reusing Annex D
+    /// §2.3.1.2 / Table D2.2) surfaces the typed
+    /// [`StereoDownmixPreference`] when `mixmdate == 1` AND `acmod > 2`.
+    /// Cover all four wire codepoints round-tripping through `parse()`.
+    #[test]
+    fn parse_surfaces_dmixmod_preference_annex_e_all_codepoints() {
+        for (code, expected) in [
+            (0b00u32, StereoDownmixPreference::NotIndicated),
+            (0b01u32, StereoDownmixPreference::LtRtPreferred),
+            (0b10u32, StereoDownmixPreference::LoRoPreferred),
+            (0b11u32, StereoDownmixPreference::Reserved),
+        ] {
+            let bits: &[(u32, u32)] = &[
+                (2, 0),    // strmtyp = independent
+                (3, 0),    // substreamid
+                (11, 383), // frmsiz
+                (2, 0),    // fscod
+                (2, 3),    // numblkscod = 3 → 6 blocks
+                (3, 7),    // acmod = 7 (3/2 — Annex E mixmdata dmixmod slot present)
+                (1, 1),    // lfeon = 1
+                (5, 16),   // bsid
+                (5, 27),   // dialnorm
+                (1, 0),    // compre
+                (1, 1),    // mixmdate = 1
+                // mixmdata body:
+                (2, code), // dmixmod codepoint under test
+                (3, 2),    // ltrtcmixlev
+                (3, 4),    // lorocmixlev
+                (3, 3),    // ltrtsurmixlev
+                (3, 5),    // lorosurmixlev
+                (1, 0),    // lfemixlevcode = 0
+                // indep substream extras (strmtyp == 0):
+                (1, 0), // pgmscle
+                (1, 0), // extpgmscle
+                (2, 0), // mixdef = 0
+                (1, 0), // frmmixcfginfoe
+                (1, 0), // infomdate
+                (1, 0), // addbsie
+            ];
+            let (buf, _) = pack_msb(bits);
+            let bsi = parse(&buf).unwrap();
+            assert_eq!(bsi.dmixmod, code as u8, "raw dmixmod for {expected:?}");
+            assert_eq!(bsi.dmixmod_preference, Some(expected));
+            assert_eq!(bsi.stereo_downmix_preference(), Some(expected));
+        }
+    }
+
+    /// Annex E 2/0 stereo with `mixmdate == 1` — the §E.1.2.2 guard
+    /// skips the 2-bit `dmixmod` slot when `acmod <= 2`, so the typed
+    /// preference is `None` even though the mixing-metadata block
+    /// was emitted.
+    #[test]
+    fn parse_leaves_dmixmod_preference_none_when_acmod_le_2_annex_e() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = independent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod = 3
+            (3, 2),    // acmod = 2 (2/0 — no dmixmod slot per Table E1.2 guard)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 1),    // mixmdate = 1
+            // mixmdata body for 2/0 indep: no dmixmod, no ltrt/loro
+            // codes, no LFE code. Just the indep tail:
+            (1, 0), // pgmscle
+            (1, 0), // extpgmscle
+            (2, 0), // mixdef
+            (1, 0), // frmmixcfginfoe
+            (1, 0), // infomdate
+            (1, 0), // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert_eq!(bsi.acmod, 2);
+        assert_eq!(bsi.dmixmod, 0xFF);
+        assert!(bsi.dmixmod_preference.is_none());
+        assert!(bsi.stereo_downmix_preference().is_none());
+    }
+
+    /// Annex E syncframe without a mixing-metadata block
+    /// (`mixmdate == 0`) — the typed preference is `None` regardless
+    /// of `acmod`.
+    #[test]
+    fn parse_leaves_dmixmod_preference_none_when_mixmdate_clear_annex_e() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),
+            (3, 0),
+            (11, 383),
+            (2, 0),
+            (2, 3),
+            (3, 7), // acmod = 7 (3/2 — slot would be present if mixmdate == 1)
+            (1, 1), // lfeon
+            (5, 16),
+            (5, 27),
+            (1, 0), // compre
+            (1, 0), // mixmdate = 0 — entire mixing-metadata block skipped
+            (1, 0), // infomdate
+            (1, 0), // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert!(bsi.dmixmod_preference.is_none());
+        assert_eq!(bsi.dmixmod, 0xFF);
     }
 
     /// Non-1+1 Annex E streams (`acmod != 0`) never carry `dialnorm2`

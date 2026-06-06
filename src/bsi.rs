@@ -77,6 +77,17 @@ pub struct Bsi {
     /// when absent. `00` = not indicated, `01` = LtRt preferred,
     /// `10` = LoRo preferred, `11` = reserved.
     pub dmixmod: u8,
+    /// Annex D §2.3.1.2 preferred stereo downmix mode (Table D2.2),
+    /// surfaced as a typed [`StereoDownmixPreference`]. `Some` only
+    /// when `bsid == 6` AND the encoder set `xbsi1e == 1`; `None`
+    /// otherwise (base §5.3.2 timecode syntax has no wire slot for
+    /// the hint). Equivalent to the typed view of [`Bsi::dmixmod`]
+    /// where the `0xFF` "absent" sentinel becomes `None`; the raw
+    /// `dmixmod` field stays authoritative for bit-stream round-trip
+    /// and the typed surface is a thin convenience over it. Lets a
+    /// §3.1.1 auto-mode two-channel-downmix router pick LtRt vs
+    /// LoRo without consulting a magic-number sentinel.
+    pub dmixmod_preference: Option<StereoDownmixPreference>,
     /// Heavy compression gain word (`compr`, §5.4.2.10 / §7.7.2.2). For
     /// 1+1 dual-mono (`acmod == 0`) this is the Ch1 word; Ch2 is
     /// surfaced separately as [`Bsi::compr_ch2`]. `Some` when
@@ -210,6 +221,18 @@ impl Bsi {
     /// `acmod == 0`.
     pub fn dialogue_normalization_ch2(&self) -> Option<DialNorm> {
         self.dialnorm_ch2.map(DialNorm::from_wire)
+    }
+
+    /// Typed view over [`Bsi::dmixmod_preference`] — the Annex D
+    /// §2.3.1.2 preferred stereo downmix mode. `Some` only when
+    /// `bsid == 6` and the encoder set `xbsi1e == 1`; `None`
+    /// otherwise. A §3.1.1 auto-mode two-channel-downmix router
+    /// should consult this hint to pick LtRt vs LoRo and fall back
+    /// to the §7.8 LoRo defaults when this returns `None` (or when
+    /// the hint reports
+    /// [`StereoDownmixPreference::is_not_indicated`]).
+    pub fn stereo_downmix_preference(&self) -> Option<StereoDownmixPreference> {
+        self.dmixmod_preference
     }
 }
 
@@ -694,6 +717,107 @@ impl AdConverterType {
             AdConverterType::Standard => 0,
             AdConverterType::Hdcd => 1,
         }
+    }
+}
+
+/// Annex D §2.3.1.2 preferred stereo downmix mode (Table D2.2).
+///
+/// Surfaced on [`Bsi::dmixmod_preference`] when `bsid == 6` and the
+/// `xbsi1e` block is present; mirrored on
+/// [`crate::eac3::Bsi::dmixmod_preference`] when the Annex E
+/// `mixmdate == 1` mixing-metadata block is present and `acmod > 2`.
+/// `None` outside those gates — base AC-3 streams with the §5.3.2
+/// timecode syntax (`bsid != 6`) cannot carry this hint, and the
+/// Annex D / Annex E spec note states the field is meaningful only
+/// for the multi-channel audio coding modes (3/0, 2/1, 3/1, 2/2,
+/// 3/2); for 1+1 / 1/0 / 2/0 the wire field is reserved and not
+/// transmitted.
+///
+/// Per §2.3.1.2 / §3.1.1 a compliant two-channel-downmix decoder
+/// "should allow the end user to specify which two-channel downmix
+/// is chosen" with an "automatic selection of either Lt/Rt or Lo/Ro
+/// based on the preferred downmix mode parameter dmixmod" as one of
+/// the three options — so the typed value is consulted by an
+/// auto-mode downmix router. The Reserved codepoint is per spec to
+/// be treated as `NotIndicated` ("the decoder should still reproduce
+/// audio. The reserved code may be interpreted as 'not indicated'").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StereoDownmixPreference {
+    /// `'00'` — not indicated by the encoder. The downmix router
+    /// falls back to the LoRo equations from the original §7.8
+    /// specification (which the AC-3 decoder defaults to when no
+    /// preference is signalled).
+    NotIndicated,
+    /// `'01'` — Lt/Rt downmix preferred. A matrix-encoded stereo
+    /// pair suitable for Dolby Pro Logic / Pro Logic II / IIx
+    /// recovery of the surround field; consult the `ltrtcmixlev`
+    /// / `ltrtsurmixlev` codewords for the per-channel gains.
+    LtRtPreferred,
+    /// `'10'` — Lo/Ro downmix preferred. A non-matrix-encoded
+    /// stereo pair suitable for conventional two-speaker playback;
+    /// consult the `lorocmixlev` / `lorosurmixlev` codewords for
+    /// the per-channel gains.
+    LoRoPreferred,
+    /// `'11'` — reserved. Per spec the decoder should treat the
+    /// reserved codepoint as equivalent to
+    /// [`NotIndicated`](Self::NotIndicated) and "should still
+    /// reproduce audio"; we surface it as its own variant so a
+    /// chain consumer can distinguish "encoder explicitly emitted
+    /// the reserved code" from "encoder emitted 'not indicated'".
+    Reserved,
+}
+
+impl StereoDownmixPreference {
+    /// Decode the 2-bit wire value verbatim per Table D2.2.
+    pub fn from_code(code: u8) -> Self {
+        match code & 0x3 {
+            0 => StereoDownmixPreference::NotIndicated,
+            1 => StereoDownmixPreference::LtRtPreferred,
+            2 => StereoDownmixPreference::LoRoPreferred,
+            _ => StereoDownmixPreference::Reserved,
+        }
+    }
+
+    /// Raw 2-bit code as it appeared on the wire.
+    pub fn raw(self) -> u8 {
+        match self {
+            StereoDownmixPreference::NotIndicated => 0,
+            StereoDownmixPreference::LtRtPreferred => 1,
+            StereoDownmixPreference::LoRoPreferred => 2,
+            StereoDownmixPreference::Reserved => 3,
+        }
+    }
+
+    /// Whether the encoder signalled an explicit Lt/Rt preference.
+    ///
+    /// Equivalent to `matches!(self, Self::LtRtPreferred)` but
+    /// expressed as a method so a downmix router can short-circuit
+    /// on the typed predicate.
+    pub fn prefers_lt_rt(self) -> bool {
+        matches!(self, StereoDownmixPreference::LtRtPreferred)
+    }
+
+    /// Whether the encoder signalled an explicit Lo/Ro preference.
+    ///
+    /// Equivalent to `matches!(self, Self::LoRoPreferred)` but
+    /// expressed as a method so a downmix router can short-circuit
+    /// on the typed predicate.
+    pub fn prefers_lo_ro(self) -> bool {
+        matches!(self, StereoDownmixPreference::LoRoPreferred)
+    }
+
+    /// Whether the codepoint should be treated as "not indicated"
+    /// — covers both the explicit [`NotIndicated`](Self::NotIndicated)
+    /// codepoint and the [`Reserved`](Self::Reserved) codepoint
+    /// (per §2.3.1.2: "the reserved code may be interpreted as
+    /// 'not indicated'"). Lets an auto-mode downmix router collapse
+    /// both into the "fall back to §7.8 LoRo defaults" branch with
+    /// a single check.
+    pub fn is_not_indicated(self) -> bool {
+        matches!(
+            self,
+            StereoDownmixPreference::NotIndicated | StereoDownmixPreference::Reserved
+        )
     }
 }
 
@@ -1320,6 +1444,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     let (
         annex_d_mix_levels,
         dmixmod,
+        dmixmod_preference,
         dsurexmod,
         dheadphonmod,
         adconvtyp,
@@ -1329,7 +1454,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     ) = if bsid == 6 {
         // Annex D xbsi1 block.
         let xbsi1e = br.read_u32(1)? != 0;
-        let (mix, dmm) = if xbsi1e {
+        let (mix, dmm, dmm_pref) = if xbsi1e {
             let dmm = br.read_u32(2)? as u8;
             let ltrtc = br.read_u32(3)? as u8;
             let ltrts = br.read_u32(3)? as u8;
@@ -1343,9 +1468,10 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
                     lorosurmixlev: loros,
                 }),
                 dmm,
+                Some(StereoDownmixPreference::from_code(dmm)),
             )
         } else {
-            (None, 0xFFu8)
+            (None, 0xFFu8, None)
         };
         // xbsi2 block — §2.3.1.7-12. 14 bits total: dsurexmod(2) +
         // dheadphonmod(2) + adconvtyp(1) + xbsi2(8) + encinfo(1). The
@@ -1371,6 +1497,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         (
             mix,
             dmm,
+            dmm_pref,
             dsex,
             dhpm,
             adcv,
@@ -1396,7 +1523,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
             None
         };
         let presence = TimeCodePresence::from_flags(timecod2e, timecod1e);
-        (None, 0xFFu8, None, None, None, tc1, tc2, presence)
+        (None, 0xFFu8, None, None, None, None, tc1, tc2, presence)
     };
 
     // addbsi — §5.4.2.29-31 trailer of 1..=64 encoder-defined bytes.
@@ -1449,6 +1576,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         dsurmod,
         annex_d_mix_levels,
         dmixmod,
+        dmixmod_preference,
         compr,
         compr_ch2,
         dsurexmod,
@@ -3473,5 +3601,156 @@ mod tests {
         assert_eq!(b.bsid, 6);
         assert!(!b.copyright_info.is_copyright_protected());
         assert!(!b.copyright_info.is_original_bitstream());
+    }
+
+    /// Round 243 — Table D2.2 / §2.3.1.2 typed surface. The 2-bit
+    /// codepoint decode is a direct lookup: `00` → `NotIndicated`,
+    /// `01` → `LtRtPreferred`, `10` → `LoRoPreferred`, `11` →
+    /// `Reserved`. `raw()` round-trips back to the original
+    /// codepoint.
+    #[test]
+    fn stereo_downmix_preference_decodes_all_four_codepoints() {
+        let cases = [
+            (0b00u8, StereoDownmixPreference::NotIndicated),
+            (0b01u8, StereoDownmixPreference::LtRtPreferred),
+            (0b10u8, StereoDownmixPreference::LoRoPreferred),
+            (0b11u8, StereoDownmixPreference::Reserved),
+        ];
+        for (code, expected) in cases {
+            let decoded = StereoDownmixPreference::from_code(code);
+            assert_eq!(decoded, expected, "code = {code:#04b}");
+            assert_eq!(decoded.raw(), code, "raw round-trip for {decoded:?}");
+        }
+    }
+
+    /// Spec §2.3.1.2 notes "the reserved code may be interpreted as
+    /// 'not indicated'" — confirm
+    /// [`StereoDownmixPreference::is_not_indicated`] collapses both
+    /// codepoints into one branch.
+    #[test]
+    fn stereo_downmix_preference_treats_reserved_as_not_indicated() {
+        assert!(StereoDownmixPreference::NotIndicated.is_not_indicated());
+        assert!(StereoDownmixPreference::Reserved.is_not_indicated());
+        assert!(!StereoDownmixPreference::LtRtPreferred.is_not_indicated());
+        assert!(!StereoDownmixPreference::LoRoPreferred.is_not_indicated());
+    }
+
+    /// Confirm the LtRt / LoRo predicates short-circuit only on
+    /// the explicit-preference variants.
+    #[test]
+    fn stereo_downmix_preference_predicates_match_explicit_variants() {
+        assert!(StereoDownmixPreference::LtRtPreferred.prefers_lt_rt());
+        assert!(!StereoDownmixPreference::LtRtPreferred.prefers_lo_ro());
+        assert!(StereoDownmixPreference::LoRoPreferred.prefers_lo_ro());
+        assert!(!StereoDownmixPreference::LoRoPreferred.prefers_lt_rt());
+        assert!(!StereoDownmixPreference::NotIndicated.prefers_lt_rt());
+        assert!(!StereoDownmixPreference::NotIndicated.prefers_lo_ro());
+        assert!(!StereoDownmixPreference::Reserved.prefers_lt_rt());
+        assert!(!StereoDownmixPreference::Reserved.prefers_lo_ro());
+    }
+
+    /// Base §5.3.2 timecode syntax (`bsid != 6`) has no wire slot
+    /// for the preferred-downmix-mode hint. The typed surface must
+    /// return `None` even when the raw `dmixmod` field carries the
+    /// `0xFF` "absent" sentinel.
+    #[test]
+    fn parse_leaves_dmixmod_preference_none_in_base_syntax() {
+        // bsid=8 (base syntax), acmod=7 (3/2 — the §2.3.1.2 note's
+        // meaningful range, were the hint actually carried). Confirm
+        // the parser reports `None` and the raw sentinel.
+        let bits: &[(u8, u32)] = &[
+            (5, 8),    // bsid (base syntax, no Annex D xbsi1 slot)
+            (3, 0),    // bsmod
+            (3, 7),    // acmod = 3/2
+            (2, 0b10), // cmixlev
+            (2, 0b01), // surmixlev
+            (1, 0),    // lfeon
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // langcode
+            (1, 0),    // audprodie
+            (1, 0),    // copyrightb
+            (1, 0),    // origbs
+            (1, 0),    // timecod1e
+            (1, 0),    // timecod2e
+            (1, 0),    // addbsie
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.bsid, 8);
+        assert_eq!(b.dmixmod, 0xFF);
+        assert!(b.dmixmod_preference.is_none());
+        assert!(b.stereo_downmix_preference().is_none());
+    }
+
+    /// Annex D `bsid == 6` with `xbsi1e == 1` surfaces the typed
+    /// preference. Cover all four wire codepoints round-tripping
+    /// through `parse()`.
+    #[test]
+    fn parse_surfaces_dmixmod_preference_annex_d_all_codepoints() {
+        for (code, expected) in [
+            (0b00u8, StereoDownmixPreference::NotIndicated),
+            (0b01u8, StereoDownmixPreference::LtRtPreferred),
+            (0b10u8, StereoDownmixPreference::LoRoPreferred),
+            (0b11u8, StereoDownmixPreference::Reserved),
+        ] {
+            let bits: &[(u8, u32)] = &[
+                (5, 6),           // bsid = 6 (Annex D alt syntax)
+                (3, 0),           // bsmod
+                (3, 7),           // acmod = 3/2 (multi-channel — Annex D xbsi1 slot present)
+                (2, 0b10),        // cmixlev
+                (2, 0b01),        // surmixlev
+                (1, 0),           // lfeon
+                (5, 27),          // dialnorm
+                (1, 0),           // compre
+                (1, 0),           // langcode
+                (1, 0),           // audprodie
+                (1, 0),           // copyrightb
+                (1, 0),           // origbs
+                (1, 1),           // xbsi1e
+                (2, code as u32), // dmixmod codepoint under test
+                (3, 0b010),       // ltrtcmixlev
+                (3, 0b010),       // ltrtsurmixlev
+                (3, 0b010),       // lorocmixlev
+                (3, 0b010),       // lorosurmixlev
+                (1, 0),           // xbsi2e
+                (1, 0),           // addbsie
+            ];
+            let bytes = pack_bits(bits);
+            let b = parse(&bytes).unwrap();
+            assert_eq!(b.bsid, 6);
+            assert_eq!(b.dmixmod, code, "raw dmixmod for {expected:?}");
+            assert_eq!(b.dmixmod_preference, Some(expected));
+            assert_eq!(b.stereo_downmix_preference(), Some(expected));
+        }
+    }
+
+    /// Annex D `bsid == 6` with `xbsi1e == 0` skips the xbsi1
+    /// block — the typed preference is `None` even though the
+    /// alternate-syntax wire slot exists in the BSI layout.
+    #[test]
+    fn parse_leaves_dmixmod_preference_none_when_xbsi1e_clear() {
+        let bits: &[(u8, u32)] = &[
+            (5, 6),    // bsid = 6
+            (3, 0),    // bsmod
+            (3, 7),    // acmod = 3/2
+            (2, 0b10), // cmixlev
+            (2, 0b01), // surmixlev
+            (1, 0),    // lfeon
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // langcode
+            (1, 0),    // audprodie
+            (1, 0),    // copyrightb
+            (1, 0),    // origbs
+            (1, 0),    // xbsi1e (cleared — block absent)
+            (1, 0),    // xbsi2e
+            (1, 0),    // addbsie
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.bsid, 6);
+        assert_eq!(b.dmixmod, 0xFF);
+        assert!(b.dmixmod_preference.is_none());
     }
 }

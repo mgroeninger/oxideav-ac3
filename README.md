@@ -256,7 +256,51 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       `eac3::bsi::tests` (encoder-default `addbsie == 0`
       short-circuit on E-AC-3, 1-byte payload, 64-byte endpoint
       payload, dependent-substream walk with `strmtyp == 1`).
-      230 lib tests, all green.
+      230 lib tests, all green. **Round 243** lifts the §2.3.1.2 /
+      Table D2.2 preferred-stereo-downmix advisory (`dmixmod`, 2
+      bits) from a raw-sentinel codepoint to a typed
+      `Bsi::dmixmod_preference: Option<StereoDownmixPreference>`
+      surface, mirrored on the Annex E `Bsi`
+      (`mixmdate == 1` mixing-metadata block reuses Annex D
+      §2.3.1.2 verbatim per Table E1.2 §E.1.2.2). The new
+      `StereoDownmixPreference` enum covers the four wire codepoints
+      — `NotIndicated` (`'00'`), `LtRtPreferred` (`'01'`),
+      `LoRoPreferred` (`'10'`), `Reserved` (`'11'`) — with `raw() ->
+      u8` for bit-stream round-trip, `prefers_lt_rt() / prefers_lo_ro()`
+      short-circuit predicates for a §3.1.1 auto-mode
+      two-channel-downmix router, and `is_not_indicated()` collapsing
+      both `NotIndicated` and `Reserved` into one branch per the
+      §2.3.1.2 spec note ("the reserved code may be interpreted as
+      'not indicated'"). `Some` only when the wire slot is actually
+      present: on the base parser when `bsid == 6` AND `xbsi1e == 1`,
+      on the Annex E parser when `mixmdate == 1` AND `acmod > 2`;
+      `None` otherwise (the §5.3.2 base timecode syntax has no slot
+      for the hint at all, and the Table E1.2 mixmdata guard skips
+      the slot for mono / 2/0 streams). The raw `dmixmod: u8` field
+      with the `0xFF` "absent" sentinel stays public on both BSI
+      structs as the authoritative wire value, so the typed surface
+      is a thin convenience for chain consumers and existing
+      consumers continue to compile. Single source of truth across
+      base + Annex E so a chain consumer can route both syntaxes
+      through one branch on
+      `Bsi::stereo_downmix_preference()`. The decoder PCM path is
+      unchanged — `dmixmod` is per §2.3.1.2 "may be used by the AC-3
+      decoder to automatically configure the type of stereo
+      downmix, but may also be overridden or ignored" — surfacing
+      the hint lets a §3.1.1 compliant downmix router pick LtRt vs
+      LoRo without re-parsing the BSI. Encoders still emit
+      `xbsi1e == 0` / `mixmdate == 0` for every syncframe so encoder
+      output is byte-identical; the only behaviour change is
+      decoder-side parsing. Covered by 5 new `bsi::tests`
+      (every-codepoint round-trip on `from_code`, the
+      `is_not_indicated()` Reserved + NotIndicated collapse, the
+      `prefers_lt_rt()` / `prefers_lo_ro()` predicate gating, the
+      §5.3.2 base-syntax `None` short-circuit through `parse()`, and
+      the Annex D `bsid == 6` + `xbsi1e == 1` round-trip across all
+      four codepoints) plus 3 new `eac3::bsi::tests` (Annex E
+      `mixmdate == 1` round-trip across all four codepoints, the
+      `acmod == 2` per-Table-E1.2 guard short-circuit, and the
+      `mixmdate == 0` baseline). 239 lib tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

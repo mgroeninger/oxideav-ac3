@@ -1852,6 +1852,12 @@ fn build_ac3_bsi_shim(bsi: &Eac3Bsi) -> Ac3Bsi {
         dsurmod: 0xFF,
         annex_d_mix_levels: None,
         dmixmod: 0xFF,
+        // Forward the Annex E mixmdata preferred stereo downmix mode
+        // (§E.1.2.2 reusing Annex D §2.3.1.2 / Table D2.2) when
+        // present so the base AC-3 downmix helpers can consult the
+        // hint through the shim; `None` short-circuits to the spec
+        // default branch.
+        dmixmod_preference: bsi.dmixmod_preference,
         compr: bsi.compr,
         compr_ch2: bsi.compr_ch2,
         dsurexmod: None,
@@ -2059,6 +2065,7 @@ mod aht_regs_tests {
             chanmap: None,
             annex_e_mix_levels: None,
             dmixmod: 0xFF,
+            dmixmod_preference: None,
             lfemixlevcod: None,
             compr: None,
             compr_ch2: None,

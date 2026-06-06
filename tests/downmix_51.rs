@@ -289,6 +289,7 @@ fn matrix_mapping_for_3_2_matches_spec() {
         dsurmod: 0xFF,
         annex_d_mix_levels: None,
         dmixmod: 0xFF,
+        dmixmod_preference: None,
         compr: None,
         compr_ch2: None,
         dsurexmod: None,

@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Preferred stereo downmix mode typed surface — `StereoDownmixPreference`
+  over `dmixmod` (§2.3.1.2 / Table D2.2 / Annex E §E.1.2.2)** (round 243
+  / r243). The 2-bit `dmixmod` codepoint that the base + Annex E
+  parsers have long surfaced as a raw `u8` (with `0xFF` "absent"
+  sentinel) now also exposes a typed `Bsi::dmixmod_preference:
+  Option<StereoDownmixPreference>` field, mirrored on the Annex E
+  `Bsi`. The `StereoDownmixPreference` enum has four variants
+  matching the wire codepoints — `NotIndicated` (`'00'`),
+  `LtRtPreferred` (`'01'`), `LoRoPreferred` (`'10'`), `Reserved`
+  (`'11'`) — with `raw() -> u8` for bit-stream round-trip,
+  `prefers_lt_rt()` / `prefers_lo_ro()` short-circuit predicates
+  for a §3.1.1 auto-mode two-channel-downmix router, and
+  `is_not_indicated()` that collapses both `NotIndicated` and
+  `Reserved` into one branch per the §2.3.1.2 spec note ("the
+  reserved code may be interpreted as 'not indicated'"). `Some` only
+  when the wire slot is actually present — on the base parser when
+  `bsid == 6` AND `xbsi1e == 1`, on the Annex E parser when
+  `mixmdate == 1` AND `acmod > 2`; `None` otherwise. The raw
+  `dmixmod: u8` field stays public on both BSI structs as the
+  authoritative wire value, so existing consumers continue to
+  compile and the typed surface is a thin convenience over it.
+  Single source of truth across base + Annex E so a chain consumer
+  can route both syntaxes through one branch on
+  `Bsi::stereo_downmix_preference()`. The decoder PCM path is
+  unchanged — `dmixmod` is per §2.3.1.2 "may be used by the AC-3
+  decoder to automatically configure the type of stereo downmix,
+  but may also be overridden or ignored" — surfacing the hint lets
+  a §3.1.1 compliant downmix router pick LtRt vs LoRo without
+  re-parsing the BSI. Encoders still emit `xbsi1e == 0` /
+  `mixmdate == 0` for every syncframe so encoder output is
+  byte-identical; the only behaviour change is decoder-side
+  parsing. Covered by 5 new `bsi::tests` (every-codepoint round-trip
+  on `from_code`, the `is_not_indicated()` Reserved + NotIndicated
+  collapse, the `prefers_lt_rt()` / `prefers_lo_ro()` predicate
+  gating, the §5.3.2 base-syntax `None` short-circuit through
+  `parse()`, and the Annex D `bsid == 6` + `xbsi1e == 1` round-trip
+  across all four codepoints) plus 3 new `eac3::bsi::tests` (Annex E
+  `mixmdate == 1` round-trip across all four codepoints, the
+  `acmod == 2` per-Table-E1.2 guard short-circuit, and the
+  `mixmdate == 0` baseline).
 - **Additional bit-stream information typed surface — `AdditionalBitStreamInfo`
   over `addbsi` (§5.4.2.29-31 / §5.3.2 / Table E1.2)** (round 240 / r240).
   The variable-length BSI trailer the base + Annex E parsers used to

@@ -609,6 +609,7 @@ mod tests {
             dsurmod: 0xFF,
             annex_d_mix_levels: None,
             dmixmod: 0xFF,
+            dmixmod_preference: None,
             compr: None,
             compr_ch2: None,
             dsurexmod: None,
@@ -646,6 +647,9 @@ mod tests {
             dsurmod: 0xFF,
             annex_d_mix_levels: Some(mix),
             dmixmod,
+            // Mirror the typed view from the raw codepoint so the
+            // fixture exercises both surfaces.
+            dmixmod_preference: Some(crate::bsi::StereoDownmixPreference::from_code(dmixmod)),
             compr: None,
             compr_ch2: None,
             dsurexmod: None,

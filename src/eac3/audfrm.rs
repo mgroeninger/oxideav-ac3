@@ -628,6 +628,7 @@ mod tests {
             chanmap: None,
             annex_e_mix_levels: None,
             dmixmod: 0xFF,
+            dmixmod_preference: None,
             lfemixlevcod: None,
             compr: None,
             compr_ch2: None,
