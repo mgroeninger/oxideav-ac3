@@ -80,8 +80,8 @@ pub struct Bsi {
     /// Annex D §2.3.1.2 preferred stereo downmix mode (Table D2.2),
     /// surfaced as a typed [`StereoDownmixPreference`]. `Some` only
     /// when `bsid == 6` AND the encoder set `xbsi1e == 1`; `None`
-    /// otherwise (base §5.3.2 timecode syntax has no wire slot for
-    /// the hint). Equivalent to the typed view of [`Bsi::dmixmod`]
+    /// otherwise (base §5.3.2 timecode syntax reuses the bit slot for
+    /// `timecod*e/timecod*`). Equivalent to the typed view of [`Bsi::dmixmod`]
     /// where the `0xFF` "absent" sentinel becomes `None`; the raw
     /// `dmixmod` field stays authoritative for bit-stream round-trip
     /// and the typed surface is a thin convenience over it. Lets a
@@ -3649,10 +3649,10 @@ mod tests {
         assert!(!StereoDownmixPreference::Reserved.prefers_lo_ro());
     }
 
-    /// Base §5.3.2 timecode syntax (`bsid != 6`) has no wire slot
-    /// for the preferred-downmix-mode hint. The typed surface must
-    /// return `None` even when the raw `dmixmod` field carries the
-    /// `0xFF` "absent" sentinel.
+    /// Base §5.3.2 timecode syntax (`bsid != 6`) reuses the bit slot
+    /// for `timecod*e/timecod*`, so the preferred-downmix-mode hint
+    /// stays absent. The typed surface must return `None` even when
+    /// the raw `dmixmod` field carries the `0xFF` "absent" sentinel.
     #[test]
     fn parse_leaves_dmixmod_preference_none_in_base_syntax() {
         // bsid=8 (base syntax), acmod=7 (3/2 — the §2.3.1.2 note's

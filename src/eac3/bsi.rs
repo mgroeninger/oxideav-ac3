@@ -184,8 +184,8 @@ pub struct Bsi {
     /// typed [`StereoDownmixPreference`]. `Some` only when
     /// `mixmdate == 1` AND `acmod > 2`; `None` otherwise (the
     /// per-Table-E1.2 guard skips the 2-bit slot for mono / 2/0
-    /// streams, and a `mixmdate == 0` syncframe carries no mixing
-    /// metadata at all). Equivalent to the typed view of
+    /// streams, and a `mixmdate == 0` syncframe skips the entire
+    /// mixing-metadata block). Equivalent to the typed view of
     /// [`Bsi::dmixmod`] where the `0xFF` "absent" sentinel becomes
     /// `None`; the raw field stays authoritative for bit-stream
     /// round-trip and the typed surface is a thin convenience over

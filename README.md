@@ -274,9 +274,10 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       'not indicated'"). `Some` only when the wire slot is actually
       present: on the base parser when `bsid == 6` AND `xbsi1e == 1`,
       on the Annex E parser when `mixmdate == 1` AND `acmod > 2`;
-      `None` otherwise (the §5.3.2 base timecode syntax has no slot
-      for the hint at all, and the Table E1.2 mixmdata guard skips
-      the slot for mono / 2/0 streams). The raw `dmixmod: u8` field
+      `None` otherwise (the §5.3.2 base timecode syntax reuses the
+      bit slot for `timecod*e/timecod*`, and the Table E1.2 mixmdata
+      guard skips the slot for mono / 2/0 streams). The raw
+      `dmixmod: u8` field
       with the `0xFF` "absent" sentinel stays public on both BSI
       structs as the authoritative wire value, so the typed surface
       is a thin convenience for chain consumers and existing
