@@ -380,6 +380,46 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       byte, the `langcode == 0` short-circuit, the 1+1 dual-mono Ch2
       mirror with `langcod2e == 1`, and the per-channel-gate
       independence on `langcod2e == 0`). 253 lib tests, all green.
+      **Round 254** lifts the §2.3.1.11-12 reserved-trailer slot
+      (8-bit `xbsi2` + 1-bit `encinfo`) that closes the Annex D
+      `xbsi2e == 1` block from parse-and-discard to a typed
+      `Bsi::extra_bsi: Option<ExtraBsi2>` field. Per §2.3.1.11
+      encoders shall set `xbsi2` to `0x00` (reserved for future
+      assignment); per §2.3.1.12 `encinfo` is reserved for
+      encoder-private use ("not used by the decoder"). The
+      `ExtraBsi2` newtype wraps both fields verbatim and exposes
+      `from_raw(u8, bool)` / `xbsi2() -> u8` / `encinfo() -> bool` /
+      `wire_bits() -> u32` (`9` — 8 bits for `xbsi2` plus 1 bit for
+      `encinfo`) plus an `is_spec_reserved_value() -> bool`
+      predicate that flags whether the carried byte matches the
+      `0x00` wire-conformance value, so a conformance probe /
+      archive tool can route non-conformant encoder output
+      (`xbsi2 != 0x00`) to a chain-of-custody log without re-parsing
+      the BSI. `encinfo` is excluded from the conformance check —
+      any value is wire-legal per §2.3.1.12. `Some` only when
+      `bsid == 6` AND the encoder set `xbsi2e == 1`; `None`
+      otherwise (the §5.3.2 base syntax reuses the bit slot for
+      `timecod2e/timecod2` and the trailer is definitionally absent
+      on `bsid != 6` streams). The block is base-AC-3 only — the
+      Annex E (E-AC-3) BSI never carries an `xbsi2e` slot — so the
+      Annex E → base-AC-3 shim in `eac3::dsp::build_ac3_bsi_shim`
+      hands the base helpers `None` unconditionally and the typed
+      surface stays on the base BSI struct. The decoder PCM path is
+      unchanged — per §2.3.1.11-12 the fields "are not used by the
+      decoder" — and encoders still emit `xbsi1e == 0` /
+      `xbsi2e == 0` for every syncframe so encoder output is
+      byte-identical; the only behaviour change is decoder-side
+      parsing. Covered by 5 new `bsi::tests` (every-byte ×
+      every-flag `from_raw` round-trip plus `Copy`/`Eq` semantics,
+      the `is_spec_reserved_value` predicate's `xbsi2 == 0x00`-only
+      acceptance across all 511 non-conformant codepoints, Annex D
+      `parse()` surfacing on a non-conformant `xbsi2 == 0xAA`
+      codepoint with `encinfo == 1`, Annex D `parse()` surfacing on
+      the spec-conformant `xbsi2 == 0x00` codepoint with
+      `encinfo == 0` cross-checked against the sibling `dheadphonmod`
+      / `adconvtyp` typed fields on a 2/0 frame, and the
+      `xbsi2e == 0` short-circuit on a `bsid == 6` frame).
+      258 lib tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

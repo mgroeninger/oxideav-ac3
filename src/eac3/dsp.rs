@@ -1874,6 +1874,10 @@ fn build_ac3_bsi_shim(bsi: &Eac3Bsi) -> Ac3Bsi {
         dsurexmod: None,
         dheadphonmod: None,
         adconvtyp: None,
+        // Annex E never carries the §2.3.1.11-12 reserved trailer — the
+        // E-AC-3 BSI does not have an `xbsi2e` block at all — so the
+        // shim hands the base helpers `None` unconditionally.
+        extra_bsi: None,
         audio_production: None,
         audio_production_ch2: None,
         timecod1: None,

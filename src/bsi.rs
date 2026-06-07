@@ -128,6 +128,15 @@ pub struct Bsi {
     /// present; `None` otherwise. `Standard` = generic 24-bit PCM
     /// converter; `Hdcd` = HDCD-encoded source.
     pub adconvtyp: Option<AdConverterType>,
+    /// Annex D §2.3.1.11-12 reserved-for-future-assignment + encoder-
+    /// private trailer of the `xbsi2` block. `Some` only when `bsid ==
+    /// 6` AND the encoder set `xbsi2e == 1`; `None` otherwise (the §5.3.2
+    /// base syntax reuses the bit slot for `timecod2e/timecod2` and the
+    /// trailer is definitionally absent). See [`ExtraBsi2`] — the
+    /// surface exposes the raw 8-bit `xbsi2` codepoint, the 1-bit
+    /// `encinfo` flag, and an `is_spec_reserved_value()` predicate that
+    /// flags non-conformant `xbsi2 != 0x00` encoder output.
+    pub extra_bsi: Option<ExtraBsi2>,
     /// §5.4.2.11-12 deprecated 8-bit `langcod` slot, surfaced as a
     /// typed [`LanguageCode`]. `Some` only when the encoder set
     /// `langcode == 1` in the bitstream; `None` when `langcode == 0`
@@ -1467,6 +1476,87 @@ impl AdditionalBitStreamInfo {
     }
 }
 
+/// Annex D §2.3.1.11-12 reserved-for-future-assignment + encoder-private
+/// trailer of the `xbsi2` block. The §2.3 alternate bit-stream syntax
+/// reserves 9 bits at the tail of the `xbsi2e == 1` block:
+///
+/// ```text
+///   xbsi2    8 bits   // §2.3.1.11 — reserved for future assignment;
+///                     //              encoders shall set to all 0s.
+///   encinfo  1 bit    // §2.3.1.12 — reserved for encoder-private use;
+///                     //              decoders do not interpret.
+/// ```
+///
+/// Both fields sit definitionally after the §2.3.1.8-10 informational
+/// metadata (`dsurexmod` / `dheadphonmod` / `adconvtyp`) inside the
+/// `xbsi2e == 1` block — see §D Table D2.1 syntax. They are decoder
+/// no-ops by spec but a conformant decoder still has to walk the bits,
+/// and a chain consumer that re-emits the stream verbatim needs the raw
+/// codepoints to round-trip the BSI without loss.
+///
+/// Surfacing the typed pair lets:
+///
+/// * a conformance probe verify that `xbsi2 == 0x00` per §2.3.1.11
+///   (a non-zero codepoint flags either a future-spec extension or a
+///   non-conformant encoder) without re-parsing the BSI,
+/// * an encoder-watermark / encoder-identification consumer recover the
+///   §2.3.1.12 `encinfo` bit without consulting a magic-number sentinel,
+/// * a verbatim re-encoder route the BSI back into a bit-stream writer
+///   bit-exactly without re-walking the wire.
+///
+/// `xbsi2` is preserved as a raw `u8` rather than parsed into a
+/// codepoint enum — §2.3.1.11 deliberately leaves the bits unassigned,
+/// so any partition would be premature. The single accessor
+/// [`Self::is_spec_reserved_value`] flags whether the carried byte
+/// matches the spec-conformance `0x00` value.
+///
+/// On the Annex E (E-AC-3) side this block does not exist — the Annex E
+/// BSI never carries an `xbsi2e == 1` slot — so the typed surface stays
+/// on the base BSI struct only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtraBsi2 {
+    xbsi2: u8,
+    encinfo: bool,
+}
+
+impl ExtraBsi2 {
+    /// Build an [`ExtraBsi2`] from the raw 8-bit `xbsi2` codepoint and
+    /// the 1-bit `encinfo` flag. No validation — both fields are
+    /// reserved (`xbsi2` for future assignment, `encinfo` for encoder
+    /// private use) so any 8-bit + 1-bit combination is wire-legal.
+    pub fn from_raw(xbsi2: u8, encinfo: bool) -> Self {
+        Self { xbsi2, encinfo }
+    }
+    /// Raw 8-bit `xbsi2` codepoint (§2.3.1.11). Per spec encoders shall
+    /// set this to `0x00`; a non-zero codepoint flags either a
+    /// future-spec extension or a non-conformant encoder.
+    pub fn xbsi2(&self) -> u8 {
+        self.xbsi2
+    }
+    /// 1-bit `encinfo` flag (§2.3.1.12). Reserved for encoder-private
+    /// use; the decoder does not interpret it.
+    pub fn encinfo(&self) -> bool {
+        self.encinfo
+    }
+    /// `true` when the carried `xbsi2` byte matches the spec-mandated
+    /// `0x00` wire-conformance value (§2.3.1.11). Lets a probe / archive
+    /// tool route streams that carry a non-conformant codepoint without
+    /// re-parsing the BSI. The `encinfo` bit is excluded from the
+    /// check — it is reserved for encoder-private use and any value is
+    /// wire-legal.
+    pub fn is_spec_reserved_value(&self) -> bool {
+        self.xbsi2 == 0x00
+    }
+    /// Total wire-field width in bits — `9` (8 bits for `xbsi2` + 1 bit
+    /// for `encinfo`). Useful for callers that need to mirror the BSI
+    /// verbatim back into a bit-stream writer; does **not** include the
+    /// gating `xbsi2e` flag that sits ahead of the informational
+    /// metadata block.
+    pub fn wire_bits(&self) -> u32 {
+        9
+    }
+}
+
 /// Annex D §2.3.1.3-6 alternate-syntax mix-level codewords. Each is a
 /// 3-bit value; Tables D2.3 / D2.4 / D2.5 / D2.6 map them to linear
 /// gains via [`annex_d_lt_rt_clev`] / [`annex_d_lt_rt_slev`] /
@@ -1660,6 +1750,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         dsurexmod,
         dheadphonmod,
         adconvtyp,
+        extra_bsi,
         timecod1,
         timecod2,
         timecode_presence,
@@ -1688,21 +1779,25 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         // xbsi2 block — §2.3.1.7-12. 14 bits total: dsurexmod(2) +
         // dheadphonmod(2) + adconvtyp(1) + xbsi2(8) + encinfo(1). The
         // last two are reserved-for-future-assignment / encoder-private
-        // respectively and stay discarded.
+        // respectively; they are captured into [`ExtraBsi2`] so a chain
+        // consumer can verify spec-conformance (`xbsi2 == 0x00`) and
+        // recover the encoder-private `encinfo` bit without re-walking
+        // the BSI.
         let xbsi2e = br.read_u32(1)? != 0;
-        let (dsex, dhpm, adcv) = if xbsi2e {
+        let (dsex, dhpm, adcv, xbsi2_tail) = if xbsi2e {
             let dsex_raw = br.read_u32(2)? as u8;
             let dhpm_raw = br.read_u32(2)? as u8;
             let adcv_raw = br.read_u32(1)? as u8;
-            let _xbsi2 = br.read_u32(8)?;
-            let _encinfo = br.read_u32(1)?;
+            let xbsi2_raw = br.read_u32(8)? as u8;
+            let encinfo_raw = br.read_u32(1)? != 0;
             (
                 Some(DolbySurroundExMode::from_code(dsex_raw)),
                 Some(DolbyHeadphoneMode::from_code(dhpm_raw)),
                 Some(AdConverterType::from_code(adcv_raw)),
+                Some(ExtraBsi2::from_raw(xbsi2_raw, encinfo_raw)),
             )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
         // Annex D syntax replaces both `timecod*` slots with
         // `xbsi*e` blocks — by definition the timecode is absent.
@@ -1713,6 +1808,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
             dsex,
             dhpm,
             adcv,
+            xbsi2_tail,
             None,
             None,
             TimeCodePresence::NotPresent,
@@ -1735,7 +1831,9 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
             None
         };
         let presence = TimeCodePresence::from_flags(timecod2e, timecod1e);
-        (None, 0xFFu8, None, None, None, None, tc1, tc2, presence)
+        (
+            None, 0xFFu8, None, None, None, None, None, tc1, tc2, presence,
+        )
     };
 
     // addbsi — §5.4.2.29-31 trailer of 1..=64 encoder-defined bytes.
@@ -1797,6 +1895,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         dsurexmod,
         dheadphonmod,
         adconvtyp,
+        extra_bsi,
         audio_production,
         audio_production_ch2,
         timecod1,
@@ -2921,6 +3020,161 @@ mod tests {
         let bytes = pack_bits(&bits);
         let b = parse(&bytes).unwrap();
         assert_eq!(b.bsid, 8);
+        assert!(b.dsurexmod.is_none());
+        assert!(b.dheadphonmod.is_none());
+        assert!(b.adconvtyp.is_none());
+        assert!(b.extra_bsi.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // ExtraBsi2 — §2.3.1.11-12 reserved + encoder-private trailer.
+    // ---------------------------------------------------------------
+
+    /// `from_raw` preserves the `xbsi2` byte and `encinfo` bit verbatim
+    /// across every combination — no validation per §2.3.1.11-12 (both
+    /// fields are reserved, so any 8+1-bit combination is wire-legal).
+    /// Also exercises the `Eq` + `Copy` semantics by passing the value
+    /// to a sibling helper after the implicit move.
+    #[test]
+    fn extra_bsi2_from_raw_round_trips_every_byte() {
+        // Every 8-bit `xbsi2` codepoint × both `encinfo` values.
+        for xbsi2 in 0u8..=255u8 {
+            for &enc in &[false, true] {
+                let x = ExtraBsi2::from_raw(xbsi2, enc);
+                assert_eq!(x.xbsi2(), xbsi2);
+                assert_eq!(x.encinfo(), enc);
+                assert_eq!(x.wire_bits(), 9);
+                // Copy: `x` survives the implicit move.
+                let y = x;
+                assert_eq!(x, y);
+            }
+        }
+    }
+
+    /// `is_spec_reserved_value` flags only the §2.3.1.11 wire-conformance
+    /// `xbsi2 == 0x00` byte; `encinfo` is excluded from the check per
+    /// §2.3.1.12 (encoder-private, any value is wire-legal).
+    #[test]
+    fn extra_bsi2_predicate_only_accepts_zero_xbsi2() {
+        // `xbsi2 == 0x00` is the only spec-conformant codepoint.
+        assert!(ExtraBsi2::from_raw(0x00, false).is_spec_reserved_value());
+        assert!(ExtraBsi2::from_raw(0x00, true).is_spec_reserved_value());
+        // Any non-zero `xbsi2` byte fails the conformance check.
+        for xbsi2 in 1u8..=255u8 {
+            assert!(!ExtraBsi2::from_raw(xbsi2, false).is_spec_reserved_value());
+            assert!(!ExtraBsi2::from_raw(xbsi2, true).is_spec_reserved_value());
+        }
+    }
+
+    /// Annex D `bsid == 6` with `xbsi2e == 1` surfaces the typed
+    /// [`ExtraBsi2`] alongside the pre-existing
+    /// `dsurexmod`/`dheadphonmod`/`adconvtyp` triplet. Confirms the
+    /// raw `xbsi2 == 0xAA` byte + `encinfo == 1` round-trip through
+    /// `parse()` and that `is_spec_reserved_value` reports `false`
+    /// for the non-conformant byte. Layout cloned from the existing
+    /// `parse_surfaces_xbsi2_dsurexmod_dheadphonmod_adconvtyp` so the
+    /// new field is the only behaviour change.
+    #[test]
+    fn parse_surfaces_extra_bsi2_nonzero_codepoint() {
+        let bits: [(u8, u32); 20] = [
+            (5, 6),           // bsid
+            (3, 0),           // bsmod
+            (3, 7),           // acmod (3/2)
+            (2, 0),           // cmixlev
+            (2, 0),           // surmixlev
+            (1, 0),           // lfeon
+            (5, 27),          // dialnorm
+            (1, 0),           // compre
+            (1, 0),           // langcode
+            (1, 0),           // audprodie
+            (1, 0),           // copyrightb
+            (1, 0),           // origbs
+            (1, 0),           // xbsi1e
+            (1, 1),           // xbsi2e = 1
+            (2, 0b10),        // dsurexmod
+            (2, 0b00),        // dheadphonmod
+            (1, 0b1),         // adconvtyp = HDCD
+            (8, 0b1010_1010), // xbsi2 (non-conformant codepoint)
+            (1, 0b1),         // encinfo = 1
+            (1, 0),           // addbsie
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        let extra = b.extra_bsi.expect("xbsi2e == 1 surfaces an ExtraBsi2");
+        assert_eq!(extra.xbsi2(), 0b1010_1010);
+        assert!(extra.encinfo());
+        assert!(!extra.is_spec_reserved_value());
+    }
+
+    /// Spec-conformant Annex D xbsi2 — `xbsi2 == 0x00` per §2.3.1.11,
+    /// `encinfo == 0` (encoder did not stash a private bit). The
+    /// `is_spec_reserved_value` predicate reports `true`. The typed
+    /// surface is `Some`, distinguishing "conformant emitted block"
+    /// from "block absent" (which is `None`).
+    #[test]
+    fn parse_surfaces_extra_bsi2_conformant_zero_codepoint() {
+        let bits: [(u8, u32); 20] = [
+            (5, 6),    // bsid
+            (3, 0),    // bsmod
+            (3, 2),    // acmod (2/0 stereo)
+            (2, 0),    // dsurmod
+            (1, 0),    // lfeon
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // langcode
+            (1, 0),    // audprodie
+            (1, 0),    // copyrightb
+            (1, 0),    // origbs
+            (1, 0),    // xbsi1e
+            (1, 1),    // xbsi2e = 1
+            (2, 0b00), // dsurexmod = NotIndicated
+            (2, 0b10), // dheadphonmod = Encoded
+            (1, 0b0),  // adconvtyp = Standard
+            (8, 0x00), // xbsi2 = spec-conformant zero
+            (1, 0b0),  // encinfo = 0
+            (1, 0),    // addbsie
+            (1, 0),    // padding (keeps the [(u8,u32); 20] cardinality)
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        let extra = b.extra_bsi.expect("xbsi2e == 1 surfaces an ExtraBsi2");
+        assert_eq!(extra.xbsi2(), 0x00);
+        assert!(!extra.encinfo());
+        assert!(extra.is_spec_reserved_value());
+        // Cross-check the sibling typed fields surface correctly too —
+        // a 2/0 frame is the only mode where `dheadphonmod` is semantically
+        // defined per §2.3.1.9.
+        assert_eq!(b.dheadphonmod, Some(DolbyHeadphoneMode::Encoded));
+        assert_eq!(b.adconvtyp, Some(AdConverterType::Standard));
+    }
+
+    /// `bsid == 6` with `xbsi2e == 0` short-circuits the xbsi2 block —
+    /// `extra_bsi` stays `None` even though the gating flag bit is on
+    /// the wire. Confirms the parser distinguishes "block absent"
+    /// (`None`) from "block present, all-zero" (`Some(0x00, false)`).
+    #[test]
+    fn parse_leaves_extra_bsi2_none_when_xbsi2e_zero() {
+        let bits: [(u8, u32); 14] = [
+            (5, 6),  // bsid
+            (3, 0),  // bsmod
+            (3, 2),  // acmod (2/0)
+            (2, 0),  // dsurmod
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 0),  // xbsi1e
+            (1, 0),  // xbsi2e = 0
+            (1, 0),  // addbsie
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.bsid, 6);
+        assert!(b.extra_bsi.is_none());
+        // Companion fields also stay None per the gate.
         assert!(b.dsurexmod.is_none());
         assert!(b.dheadphonmod.is_none());
         assert!(b.adconvtyp.is_none());

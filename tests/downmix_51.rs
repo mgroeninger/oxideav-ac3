@@ -298,6 +298,7 @@ fn matrix_mapping_for_3_2_matches_spec() {
         dsurexmod: None,
         dheadphonmod: None,
         adconvtyp: None,
+        extra_bsi: None,
         audio_production: None,
         audio_production_ch2: None,
         timecod1: None,
