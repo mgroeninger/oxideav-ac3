@@ -287,6 +287,7 @@ fn matrix_mapping_for_3_2_matches_spec() {
         cmixlev: 0,
         surmixlev: 0,
         dsurmod: 0xFF,
+        dolby_surround_mode: None,
         annex_d_mix_levels: None,
         dmixmod: 0xFF,
         dmixmod_preference: None,

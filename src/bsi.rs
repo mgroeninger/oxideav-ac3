@@ -66,6 +66,16 @@ pub struct Bsi {
     pub surmixlev: u8,
     /// Dolby-Surround flag for 2/0 stereo streams; 0xFF when absent.
     pub dsurmod: u8,
+    /// §5.4.2.6 Dolby Surround mode (Table 5.11), surfaced as a typed
+    /// [`DolbySurroundMode`]. `Some` only when `acmod == 2` (2/0 stereo
+    /// — the only channel layout that carries the codeword on the wire);
+    /// `None` otherwise. Equivalent to the typed view of [`Bsi::dsurmod`]
+    /// where the `0xFF` "absent" sentinel becomes `None`; the raw
+    /// `dsurmod` field stays public for bit-stream round-trip and the
+    /// typed surface is a thin convenience over it. Lets a Pro Logic-aware
+    /// receiver arm its matrix decoder without consulting a magic-number
+    /// sentinel — paired with [`Bsi::dolby_surround_mode`].
+    pub dolby_surround_mode: Option<DolbySurroundMode>,
     /// Annex D §2.3 "alternate bit stream syntax" mix-level extensions.
     /// `Some` only when `bsid == 6` AND the encoder set `xbsi1e == 1`;
     /// `None` otherwise. The four 3-bit codewords (`ltrtcmixlev` /
@@ -233,6 +243,18 @@ impl Bsi {
     /// [`StereoDownmixPreference::is_not_indicated`]).
     pub fn stereo_downmix_preference(&self) -> Option<StereoDownmixPreference> {
         self.dmixmod_preference
+    }
+
+    /// Typed view over [`Bsi::dolby_surround_mode`] — the §5.4.2.6
+    /// base-syntax Dolby Surround mode (Table 5.11). `Some` only when
+    /// `acmod == 2` (2/0 stereo); `None` otherwise. A Pro Logic-aware
+    /// receiver can consult this hint to arm its matrix decoder for a
+    /// program that was matrix-encoded for surround-from-stereo
+    /// recovery. The decoder PCM path is unchanged — per §5.4.2.6 the
+    /// field "is not used by the AC-3 decoder, but may be used by
+    /// other portions of the audio reproduction equipment".
+    pub fn dolby_surround_mode(&self) -> Option<DolbySurroundMode> {
+        self.dolby_surround_mode
     }
 }
 
@@ -685,6 +707,87 @@ impl DolbyHeadphoneMode {
             DolbyHeadphoneMode::Encoded => 2,
             DolbyHeadphoneMode::Reserved => 3,
         }
+    }
+}
+
+/// Base-syntax §5.4.2.6 Dolby Surround mode (Table 5.11). A 2-bit
+/// advisory carried in 2/0 stereo streams (`acmod == 2`) that flags
+/// whether the program was matrix-encoded for a Dolby Surround
+/// (Pro Logic-decodable) playback path.
+///
+/// Surfaced on [`Bsi::dolby_surround_mode`] when `acmod == 2`; the
+/// parser returns `None` for every other channel mode because the
+/// `dsurmod` slot is not on the wire there (§5.3.2 only emits the
+/// 2-bit codeword inside the `acmod == 0x2` guard). The Annex E
+/// informational-metadata block (§E.2.3.1.x) carries the same field
+/// under the same `acmod == 2` guard, so the Annex E `Bsi` reuses
+/// this enum verbatim — single source of truth for both syntaxes.
+///
+/// Per §5.4.2.6: "This information is not used by the AC-3 decoder,
+/// but may be used by other portions of the audio reproduction
+/// equipment. If `dsurmod` is set to the reserved code, the decoder
+/// should still reproduce audio. The reserved code may be
+/// interpreted as 'not indicated'." A receiver that has a Pro Logic
+/// matrix decoder available can pre-arm it when this surface reports
+/// [`DolbySurroundMode::Encoded`].
+///
+/// This is the base-syntax cousin of the Annex D §2.3.1.8
+/// [`DolbySurroundExMode`] (which extends the same advisory pattern
+/// to 6/7-channel `acmod` layouts for the EX / Pro Logic IIx / IIz
+/// matrix variants). The two surfaces are independent — a 2/0 stream
+/// can only carry `dsurmod`, a 5.1 stream can only carry `dsurexmod`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DolbySurroundMode {
+    /// `'00'` — encoding not indicated.
+    NotIndicated,
+    /// `'01'` — explicitly NOT Dolby Surround encoded.
+    NotEncoded,
+    /// `'10'` — Dolby Surround encoded (matrix-encoded for a
+    /// Pro Logic-decodable playback path).
+    Encoded,
+    /// `'11'` — reserved (per §5.4.2.6 the decoder must keep
+    /// reproducing audio and may interpret this codepoint as
+    /// [`NotIndicated`](Self::NotIndicated)).
+    Reserved,
+}
+
+impl DolbySurroundMode {
+    /// Decode the 2-bit wire value verbatim per Table 5.11.
+    pub fn from_code(code: u8) -> Self {
+        match code & 0x3 {
+            0 => DolbySurroundMode::NotIndicated,
+            1 => DolbySurroundMode::NotEncoded,
+            2 => DolbySurroundMode::Encoded,
+            _ => DolbySurroundMode::Reserved,
+        }
+    }
+
+    /// Raw 2-bit code as it appeared on the wire.
+    pub fn raw(self) -> u8 {
+        match self {
+            DolbySurroundMode::NotIndicated => 0,
+            DolbySurroundMode::NotEncoded => 1,
+            DolbySurroundMode::Encoded => 2,
+            DolbySurroundMode::Reserved => 3,
+        }
+    }
+
+    /// `true` when the field collapses to "no useful information" per
+    /// the §5.4.2.6 spec note ("the reserved code may be interpreted
+    /// as 'not indicated'") — both [`NotIndicated`](Self::NotIndicated)
+    /// and [`Reserved`](Self::Reserved) fold into one branch for a
+    /// receiver that wants to apply a matrix-decode default.
+    pub fn is_not_indicated(self) -> bool {
+        matches!(
+            self,
+            DolbySurroundMode::NotIndicated | DolbySurroundMode::Reserved
+        )
+    }
+
+    /// `true` only for [`Encoded`](Self::Encoded) — a Pro Logic-aware
+    /// receiver can use this predicate to arm its matrix decoder.
+    pub fn is_dolby_surround_encoded(self) -> bool {
+        matches!(self, DolbySurroundMode::Encoded)
     }
 }
 
@@ -1355,10 +1458,11 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     };
 
     // dsurmod — present only in 2/0 mode (acmod == 0x2).
-    let dsurmod = if acmod == 0x2 {
-        br.read_u32(2)? as u8
+    let (dsurmod, dolby_surround_mode) = if acmod == 0x2 {
+        let raw = br.read_u32(2)? as u8;
+        (raw, Some(DolbySurroundMode::from_code(raw)))
     } else {
-        0xFF
+        (0xFF, None)
     };
 
     let lfeon = br.read_u32(1)? != 0;
@@ -1574,6 +1678,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         cmixlev,
         surmixlev,
         dsurmod,
+        dolby_surround_mode,
         annex_d_mix_levels,
         dmixmod,
         dmixmod_preference,
@@ -3215,6 +3320,118 @@ mod tests {
         assert!(b.dsurexmod.is_none());
         assert!(b.dheadphonmod.is_none());
         assert!(b.adconvtyp.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // DolbySurroundMode — §5.4.2.6 / Table 5.11 (2/0 stereo `acmod==2`).
+    // ---------------------------------------------------------------
+
+    /// Table 5.11 — `dsurmod` decodes verbatim across all 4 codepoints
+    /// and the raw round-trip is byte-stable.
+    #[test]
+    fn dsurmod_decodes_all_4_codepoints() {
+        use DolbySurroundMode::*;
+        assert_eq!(DolbySurroundMode::from_code(0b00), NotIndicated);
+        assert_eq!(DolbySurroundMode::from_code(0b01), NotEncoded);
+        assert_eq!(DolbySurroundMode::from_code(0b10), Encoded);
+        assert_eq!(DolbySurroundMode::from_code(0b11), Reserved);
+        for code in 0u8..4 {
+            assert_eq!(DolbySurroundMode::from_code(code).raw(), code);
+        }
+    }
+
+    /// §5.4.2.6 spec note: the reserved code "may be interpreted as
+    /// 'not indicated'" — `is_not_indicated()` collapses both
+    /// codepoints into one branch.
+    #[test]
+    fn dsurmod_is_not_indicated_collapses_reserved() {
+        use DolbySurroundMode::*;
+        assert!(NotIndicated.is_not_indicated());
+        assert!(Reserved.is_not_indicated());
+        assert!(!NotEncoded.is_not_indicated());
+        assert!(!Encoded.is_not_indicated());
+        // Encoded is the only codepoint that should arm a matrix decoder.
+        assert!(Encoded.is_dolby_surround_encoded());
+        assert!(!NotIndicated.is_dolby_surround_encoded());
+        assert!(!NotEncoded.is_dolby_surround_encoded());
+        assert!(!Reserved.is_dolby_surround_encoded());
+    }
+
+    /// 2/0 stereo (`acmod == 2`) syncframe surfaces the typed
+    /// `dolby_surround_mode` view of the on-wire codepoint. Walk all
+    /// four Table 5.11 rows through `parse()` and check both the raw
+    /// `dsurmod` byte and the typed `Option<DolbySurroundMode>` line
+    /// up.
+    #[test]
+    fn parse_surfaces_dolby_surround_mode_on_2_0() {
+        for code in 0u32..4 {
+            // bsid=8, bsmod=0, acmod=2, cmixlev absent, surmixlev absent,
+            // dsurmod=code, lfeon=0, dialnorm=27, then the optional
+            // chain clipped down to a tail of zeros (compre=0, langcode=0,
+            // audprodie=0, copyrightb=0, origbs=0, timecod1e=0,
+            // timecod2e=0, addbsie=0).
+            let bits: [(u8, u32); 14] = [
+                (5, 8), // bsid
+                (3, 0), // bsmod
+                (3, 2), // acmod
+                // cmixlev absent (acmod & 1 == 0 → guard false)
+                // surmixlev absent (acmod & 4 == 0 → guard false)
+                (2, code), // dsurmod
+                (1, 0),    // lfeon
+                (5, 27),   // dialnorm
+                (1, 0),    // compre
+                (1, 0),    // langcode
+                (1, 0),    // audprodie
+                (1, 0),    // copyrightb
+                (1, 0),    // origbs
+                (1, 0),    // timecod1e
+                (1, 0),    // timecod2e
+                (1, 0),    // addbsie
+            ];
+            let bytes = pack_bits(&bits);
+            let b = parse(&bytes).unwrap();
+            assert_eq!(b.bsid, 8);
+            assert_eq!(b.acmod, 2);
+            assert_eq!(b.dsurmod, code as u8);
+            let expected = DolbySurroundMode::from_code(code as u8);
+            assert_eq!(b.dolby_surround_mode, Some(expected));
+            // Accessor matches the field.
+            assert_eq!(b.dolby_surround_mode(), Some(expected));
+        }
+    }
+
+    /// `acmod != 2` syncframe — the §5.3.2 guard skips the 2-bit
+    /// `dsurmod` slot entirely, so the typed `dolby_surround_mode`
+    /// resolves to `None` and the raw byte stays at the `0xFF`
+    /// "absent" sentinel.
+    #[test]
+    fn parse_dolby_surround_mode_none_when_acmod_not_2_0() {
+        // bsid=8, bsmod=0, acmod=7 (3/2 — no dsurmod slot), cmixlev=0,
+        // surmixlev=0, lfeon=0, dialnorm=27, tail zeros.
+        let bits: [(u8, u32); 15] = [
+            (5, 8),
+            (3, 0),
+            (3, 7), // acmod = 3/2 (5-channel)
+            (2, 0), // cmixlev (acmod & 1 != 0)
+            (2, 0), // surmixlev (acmod & 4 != 0)
+            // dsurmod absent (acmod != 2)
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 0),  // addbsie
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.acmod, 7);
+        assert_eq!(b.dsurmod, 0xFF);
+        assert!(b.dolby_surround_mode.is_none());
+        assert!(b.dolby_surround_mode().is_none());
     }
 
     // ---------------------------------------------------------------

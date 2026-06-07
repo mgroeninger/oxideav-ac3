@@ -302,6 +302,53 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       `mixmdate == 1` round-trip across all four codepoints, the
       `acmod == 2` per-Table-E1.2 guard short-circuit, and the
       `mixmdate == 0` baseline). 239 lib tests, all green.
+      **Round 246** brings the §5.4.2.6 base-syntax Dolby Surround
+      mode (`dsurmod`, 2 bits, Table 5.11) up to the same typed
+      treatment via a new
+      `Bsi::dolby_surround_mode: Option<DolbySurroundMode>` field,
+      mirrored on the Annex E `Bsi` (the §E.2.3.1.x
+      informational-metadata `acmod == 2` branch had been parsing
+      the slot and discarding it — surfacing it brings parity with
+      the base-syntax view). `DolbySurroundMode` covers the four
+      wire codepoints — `NotIndicated` (`'00'`), `NotEncoded`
+      (`'01'`), `Encoded` (`'10'`), `Reserved` (`'11'`) — with
+      `raw() -> u8` for bit-stream round-trip,
+      `is_dolby_surround_encoded()` short-circuit predicate for a
+      Pro Logic-aware receiver to arm its matrix decoder, and
+      `is_not_indicated()` collapsing both `NotIndicated` and
+      `Reserved` into one branch per the §5.4.2.6 spec note ("the
+      reserved code may be interpreted as 'not indicated'"). `Some`
+      only when the wire slot is actually present: on the base
+      parser when `acmod == 2`, on the Annex E parser when
+      `infomdate == 1` AND `acmod == 2`; `None` otherwise. The raw
+      `dsurmod: u8` field with the `0xFF` "absent" sentinel stays
+      public on the base BSI struct as the authoritative wire value
+      so existing consumers continue to compile. Single source of
+      truth across base + Annex E — the Annex E
+      informational-metadata `dsurmod` slot reuses Table 5.11
+      semantics verbatim, so a chain consumer can route both
+      syntaxes through one branch on `Bsi::dolby_surround_mode()`.
+      The Annex E → base-AC-3 shim in
+      `eac3::dsp::build_ac3_bsi_shim` forwards the typed field
+      through unchanged so the base AC-3 downmix helpers can consult
+      it on an Annex E playback path too. The decoder PCM path is
+      unchanged — per §5.4.2.6 the field "is not used by the AC-3
+      decoder, but may be used by other portions of the audio
+      reproduction equipment" — surfacing the hint lets a Pro
+      Logic-aware receiver arm its matrix decoder without re-parsing
+      the BSI. Encoders still emit `dsurmod == 0` (NotIndicated) for
+      every 2/0 syncframe so encoder output is byte-identical; the
+      only behaviour change is decoder-side parsing. Covered by 4
+      new `bsi::tests` (every-codepoint round-trip on `from_code`,
+      the `is_not_indicated()` Reserved + NotIndicated collapse, the
+      `is_dolby_surround_encoded()` predicate gating, the §5.3.2
+      base-syntax `parse()` round-trip across all four codepoints on
+      `acmod == 2`, plus a `None` short-circuit on `acmod != 2`)
+      plus 3 new `eac3::bsi::tests` (Annex E `infomdate == 1`
+      round-trip across all four codepoints on `acmod == 2`, the
+      per-Table-E1.2 `acmod != 2` guard short-circuit on a 3/2
+      frame, and the `infomdate == 0` baseline). 246 lib tests, all
+      green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

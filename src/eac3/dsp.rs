@@ -1850,6 +1850,12 @@ fn build_ac3_bsi_shim(bsi: &Eac3Bsi) -> Ac3Bsi {
         cmixlev: 0xFF,
         surmixlev: 0xFF,
         dsurmod: 0xFF,
+        // Forward the Annex E informational-metadata Dolby Surround mode
+        // (§E.2.3.1.x reusing §5.4.2.6 / Table 5.11) when present so the
+        // base AC-3 downmix helpers can consult the matrix-encode hint
+        // through the shim; `None` when the upstream BSI did not surface
+        // it (`infomdate == 0` or `acmod != 2`).
+        dolby_surround_mode: bsi.dolby_surround_mode,
         annex_d_mix_levels: None,
         dmixmod: 0xFF,
         // Forward the Annex E mixmdata preferred stereo downmix mode
@@ -2071,6 +2077,7 @@ mod aht_regs_tests {
             compr_ch2: None,
             dsurexmod: None,
             dheadphonmod: None,
+            dolby_surround_mode: None,
             adconvtyp: None,
             adconvtyp_ch2: None,
             audio_production: None,

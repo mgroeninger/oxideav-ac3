@@ -634,6 +634,7 @@ mod tests {
             compr_ch2: None,
             dsurexmod: None,
             dheadphonmod: None,
+            dolby_surround_mode: None,
             adconvtyp: None,
             adconvtyp_ch2: None,
             audio_production: None,

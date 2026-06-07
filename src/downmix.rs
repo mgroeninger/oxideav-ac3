@@ -607,6 +607,7 @@ mod tests {
             cmixlev,
             surmixlev,
             dsurmod: 0xFF,
+            dolby_surround_mode: None,
             annex_d_mix_levels: None,
             dmixmod: 0xFF,
             dmixmod_preference: None,
@@ -645,6 +646,7 @@ mod tests {
             cmixlev: 0xFF,
             surmixlev: 0xFF,
             dsurmod: 0xFF,
+            dolby_surround_mode: None,
             annex_d_mix_levels: Some(mix),
             dmixmod,
             // Mirror the typed view from the raw codepoint so the

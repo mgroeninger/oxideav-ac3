@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dolby Surround mode typed surface — `DolbySurroundMode` over
+  base-syntax `dsurmod` (§5.4.2.6 / Table 5.11 / Annex E §E.2.3.1.x)**
+  (round 246 / r246). The 2-bit `dsurmod` codepoint that the base
+  AC-3 parser has long surfaced as a raw `u8` (with `0xFF` "absent"
+  sentinel) now also exposes a typed
+  `Bsi::dolby_surround_mode: Option<DolbySurroundMode>` field,
+  mirrored on the Annex E `Bsi`. On the Annex E side the slot was
+  previously parsed-and-discarded inside the §E.2.3.1.x
+  informational-metadata `acmod == 2` branch — surfacing it brings
+  parity with the base-syntax surface and makes both syntaxes
+  routable through one branch on `Bsi::dolby_surround_mode()`. The
+  `DolbySurroundMode` enum has four variants matching the wire
+  codepoints — `NotIndicated` (`'00'`), `NotEncoded` (`'01'`),
+  `Encoded` (`'10'`), `Reserved` (`'11'`) — with `raw() -> u8` for
+  bit-stream round-trip, `is_dolby_surround_encoded()` short-circuit
+  predicate for a Pro Logic-aware receiver to arm its matrix decoder,
+  and `is_not_indicated()` that collapses both `NotIndicated` and
+  `Reserved` into one branch per the §5.4.2.6 spec note ("the
+  reserved code may be interpreted as 'not indicated'"). `Some` only
+  when the wire slot is actually present — on the base parser when
+  `acmod == 2`, on the Annex E parser when `infomdate == 1` AND
+  `acmod == 2`; `None` otherwise. The raw `dsurmod: u8` field stays
+  public on the base `Bsi` as the authoritative wire value, so
+  existing consumers continue to compile and the typed surface is a
+  thin convenience over it. Single source of truth across base +
+  Annex E — the Annex E informational-metadata `dsurmod` slot is
+  defined to reuse Table 5.11 semantics verbatim, so a chain consumer
+  can route both syntaxes through the same enum. The decoder PCM
+  path is unchanged — per §5.4.2.6 the field "is not used by the
+  AC-3 decoder, but may be used by other portions of the audio
+  reproduction equipment" — surfacing the hint lets a Pro
+  Logic-aware receiver arm its matrix decoder without re-parsing
+  the BSI. Encoders still emit `dsurmod == 0` (NotIndicated) for
+  every 2/0 syncframe so encoder output is byte-identical; the only
+  behaviour change is decoder-side parsing. The Annex E → base-AC-3
+  shim in `eac3::dsp::build_ac3_bsi_shim` forwards the typed field
+  through unchanged so the base AC-3 downmix helpers can consult it
+  on an Annex E playback path too. Covered by 4 new `bsi::tests`
+  (every-codepoint round-trip on `from_code`, the
+  `is_not_indicated()` Reserved + NotIndicated collapse, the
+  `is_dolby_surround_encoded()` predicate gating, the §5.3.2
+  base-syntax `parse()` round-trip across all four codepoints on
+  `acmod == 2`, plus a `None` short-circuit on `acmod != 2`) plus 3
+  new `eac3::bsi::tests` (Annex E `infomdate == 1` round-trip
+  across all four codepoints on `acmod == 2`, the per-Table-E1.2
+  `acmod != 2` guard short-circuit on a 3/2 frame, and the
+  `infomdate == 0` baseline).
 - **Preferred stereo downmix mode typed surface — `StereoDownmixPreference`
   over `dmixmod` (§2.3.1.2 / Table D2.2 / Annex E §E.1.2.2)** (round 243
   / r243). The 2-bit `dmixmod` codepoint that the base + Annex E
