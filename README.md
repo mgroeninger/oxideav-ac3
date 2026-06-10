@@ -879,7 +879,24 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       integration test that round-trips the encoder's 7.1 indep+dep
       pair through the in-tree decoder asserting
       `dep_locations == [LeftRearSurround, RightRearSurround]` on
-      every packet.
+      every packet. **Round 274** adds the spec-grounded classification
+      + re-emit surface the routing foundation was waiting on:
+      `ChannelLocation::ALL` (the 22 distinct Table E2.5 variants in bit
+      order, pair-bits expanded left-then-right), `table_e2_5_bit()` (the
+      `0..=15` location bit a variant decoded from — the exact inverse of
+      `expand_chanmap_locations`, both pair halves sharing the row's
+      single bit), `chanmap_weight()` (the MSB-first `1 << (15 - bit)`
+      field weight per §E.2.3.1.8, so a decoded location list OR's
+      straight back into the original 16-bit `chanmap` without
+      double-counting pair-bits), `is_pair_half()` + `pair_companion()`
+      (the 12 expanded halves of the six pair-bits and the other half of
+      each), `is_lfe()` (bits 14/15), `is_height()` (the SMPTE 428-3
+      above-plane rows — `Ts` / `Vhl/Vhr` / `Vhc` / `Lts/Rts`), and
+      `is_surround()` (the ear-level `Ls/Rs` / `Cs` / `Lrs/Rrs` /
+      `Lsd/Rsd` rows). Pure metadata over the already-decoded location
+      list — the PCM path is unchanged and encoder output is
+      byte-identical — covered by 8 new `eac3::chanmap::tests` (285 lib
+      tests, all green).
 - [x] E-AC-3 decoder — **Adaptive Hybrid Transform (AHT)** decode,
       multichannel full-bandwidth + LFE + coupling (round 6 mono →
       round 110 fbw → round 113 LFE → round 117 coupling / r117). The

@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 §E.2.3.1.8 / Table E2.5 `ChannelLocation` classification
+  surface** (round 274 / r274). The `chanmap` custom-channel-map decoder
+  (`eac3::chanmap`) already expanded the 16-bit field into an ordered
+  `Vec<ChannelLocation>` (r196); this round adds a spec-grounded
+  classification + re-emit surface to the `ChannelLocation` enum so a
+  future 7.1 WAVE-mask reorderer or a chanmap-aware §7.8 downmix router
+  can route the decoded dep-substream channels without re-walking
+  Table E2.5. New: `ChannelLocation::ALL` (the 22 distinct variants in
+  Table E2.5 bit order, pair-bits expanded left-then-right);
+  `table_e2_5_bit() -> u8` (the `0..=15` location bit a variant decoded
+  from — both halves of a pair-bit share the row's single bit, making it
+  the exact inverse of `expand_chanmap_locations`); `chanmap_weight() ->
+  u16` (the MSB-first `1 << (15 - bit)` field weight per §E.2.3.1.8, so a
+  consumer can OR a decoded location list straight back into the original
+  16-bit `chanmap` — pair halves share one weight and are not
+  double-counted); `is_pair_half()` + `pair_companion()` (the 12 expanded
+  halves of the six Table E2.5 pair-bits — `Lc/Rc`, `Lrs/Rrs`, `Lsd/Rsd`,
+  `Lw/Rw`, `Vhl/Vhr`, `Lts/Rts` — and the other half of each pair);
+  `is_lfe()` (the two LFE rows, bits 14/15); `is_height()` (the
+  SMPTE 428-3 above-plane rows — `Ts` bit 8, `Vhl/Vhr` bit 11, `Vhc`
+  bit 12, `Lts/Rts` bit 13); and `is_surround()` (the ear-level surround
+  rows — `Ls/Rs`, `Cs`, `Lrs/Rrs`, `Lsd/Rsd`). The decoder PCM path is
+  unchanged — these are pure metadata accessors over the already-decoded
+  location list — and encoder output is byte-identical (the in-tree
+  encoder still emits 7.1 as an indep 5.1 + a dep `Lrs/Rrs`-pair
+  substream). The only change is the new public classification surface.
+  Covered by 8 new `eac3::chanmap::tests` (the `ALL` ordering /
+  no-duplicate invariant, every Table E2.5 row's `table_e2_5_bit`, the
+  MSB-first `chanmap_weight`, the decode→`chanmap_weight`-OR round-trip
+  including pair-bit non-double-counting on both spec examples,
+  `is_pair_half` / `pair_companion` over all 12 halves + the
+  single-channel `None` cases, and the disjoint `is_lfe` / `is_height` /
+  `is_surround` partitions over the full `ALL` set). 285 lib tests, all
+  green.
+
 - **Base §5.4.1.4 frame-size code typed surface — `FrameSizeCode`
   (Table 5.18)** (round 271 / r271). The 6-bit `frmsizecod` field that
   every AC-3 syncframe carries — long parsed into a raw `u8` and a

@@ -90,6 +90,170 @@ pub enum ChannelLocation {
     Lfe,
 }
 
+impl ChannelLocation {
+    /// Every [`ChannelLocation`] variant, in Table E2.5 bit order
+    /// (bit 0 → bit 15) with each pair-bit expanded to its two halves
+    /// in the spec's documented left-then-right order. Lets a consumer
+    /// iterate the full reference grid without re-deriving the variant
+    /// list (e.g. building a lookup from a physical speaker position
+    /// back to its [`ChannelLocation`]).
+    pub const ALL: [ChannelLocation; 22] = [
+        ChannelLocation::Left,
+        ChannelLocation::Center,
+        ChannelLocation::Right,
+        ChannelLocation::LeftSurround,
+        ChannelLocation::RightSurround,
+        ChannelLocation::LeftCenter,
+        ChannelLocation::RightCenter,
+        ChannelLocation::LeftRearSurround,
+        ChannelLocation::RightRearSurround,
+        ChannelLocation::CenterSurround,
+        ChannelLocation::TopSurround,
+        ChannelLocation::LeftSurroundDirect,
+        ChannelLocation::RightSurroundDirect,
+        ChannelLocation::LeftWide,
+        ChannelLocation::RightWide,
+        ChannelLocation::VerticalHeightLeft,
+        ChannelLocation::VerticalHeightRight,
+        ChannelLocation::VerticalHeightCenter,
+        ChannelLocation::TopSurroundLeft,
+        ChannelLocation::TopSurroundRight,
+        ChannelLocation::Lfe2,
+        ChannelLocation::Lfe,
+    ];
+
+    /// The Table E2.5 location bit (`0..=15`) this variant was decoded
+    /// from. Each of the six pair-bits (5, 6, 9, 10, 11, 13) maps both
+    /// of its expanded halves to the same shared bit — e.g. both
+    /// [`Self::LeftRearSurround`] and [`Self::RightRearSurround`] return
+    /// `6` (the "Lrs/Rrs pair" row). This is the inverse of the
+    /// [`expand_chanmap_locations`] decode: a consumer that wants to
+    /// re-emit a `chanmap` field can OR together
+    /// `1 << (15 - loc.table_e2_5_bit())` over the location list.
+    pub fn table_e2_5_bit(self) -> u8 {
+        match self {
+            ChannelLocation::Left => 0,
+            ChannelLocation::Center => 1,
+            ChannelLocation::Right => 2,
+            ChannelLocation::LeftSurround => 3,
+            ChannelLocation::RightSurround => 4,
+            ChannelLocation::LeftCenter | ChannelLocation::RightCenter => 5,
+            ChannelLocation::LeftRearSurround | ChannelLocation::RightRearSurround => 6,
+            ChannelLocation::CenterSurround => 7,
+            ChannelLocation::TopSurround => 8,
+            ChannelLocation::LeftSurroundDirect | ChannelLocation::RightSurroundDirect => 9,
+            ChannelLocation::LeftWide | ChannelLocation::RightWide => 10,
+            ChannelLocation::VerticalHeightLeft | ChannelLocation::VerticalHeightRight => 11,
+            ChannelLocation::VerticalHeightCenter => 12,
+            ChannelLocation::TopSurroundLeft | ChannelLocation::TopSurroundRight => 13,
+            ChannelLocation::Lfe2 => 14,
+            ChannelLocation::Lfe => 15,
+        }
+    }
+
+    /// The 16-bit `chanmap` field weight for this location's Table E2.5
+    /// bit — `1 << (15 - table_e2_5_bit())`. Bit 0 (Left) lives in the
+    /// MSB per §E.2.3.1.8, so the weight of bit 0 is `0x8000` and the
+    /// weight of bit 15 (LFE) is `0x0001`. Both halves of a pair-bit
+    /// share the same weight (the single set bit that expanded to two
+    /// channels).
+    pub fn chanmap_weight(self) -> u16 {
+        1u16 << (15 - self.table_e2_5_bit())
+    }
+
+    /// `true` when this location is one half of a Table E2.5 pair-bit
+    /// (bits 5, 6, 9, 10, 11, 13 — `Lc/Rc`, `Lrs/Rrs`, `Lsd/Rsd`,
+    /// `Lw/Rw`, `Vhl/Vhr`, `Lts/Rts`). A single set pair-bit decodes to
+    /// two adjacent coded channels per §E.2.3.1.8, so a consumer that
+    /// re-emits a `chanmap` must set the shared bit exactly once for the
+    /// two halves rather than once each.
+    pub fn is_pair_half(self) -> bool {
+        matches!(
+            self,
+            ChannelLocation::LeftCenter
+                | ChannelLocation::RightCenter
+                | ChannelLocation::LeftRearSurround
+                | ChannelLocation::RightRearSurround
+                | ChannelLocation::LeftSurroundDirect
+                | ChannelLocation::RightSurroundDirect
+                | ChannelLocation::LeftWide
+                | ChannelLocation::RightWide
+                | ChannelLocation::VerticalHeightLeft
+                | ChannelLocation::VerticalHeightRight
+                | ChannelLocation::TopSurroundLeft
+                | ChannelLocation::TopSurroundRight
+        )
+    }
+
+    /// The companion half of a Table E2.5 pair-bit location, or `None`
+    /// for a single-channel location. For [`Self::LeftRearSurround`]
+    /// this returns [`Self::RightRearSurround`] and vice-versa — letting
+    /// a consumer pair up the two adjacent coded channels a single set
+    /// pair-bit expanded to.
+    pub fn pair_companion(self) -> Option<ChannelLocation> {
+        Some(match self {
+            ChannelLocation::LeftCenter => ChannelLocation::RightCenter,
+            ChannelLocation::RightCenter => ChannelLocation::LeftCenter,
+            ChannelLocation::LeftRearSurround => ChannelLocation::RightRearSurround,
+            ChannelLocation::RightRearSurround => ChannelLocation::LeftRearSurround,
+            ChannelLocation::LeftSurroundDirect => ChannelLocation::RightSurroundDirect,
+            ChannelLocation::RightSurroundDirect => ChannelLocation::LeftSurroundDirect,
+            ChannelLocation::LeftWide => ChannelLocation::RightWide,
+            ChannelLocation::RightWide => ChannelLocation::LeftWide,
+            ChannelLocation::VerticalHeightLeft => ChannelLocation::VerticalHeightRight,
+            ChannelLocation::VerticalHeightRight => ChannelLocation::VerticalHeightLeft,
+            ChannelLocation::TopSurroundLeft => ChannelLocation::TopSurroundRight,
+            ChannelLocation::TopSurroundRight => ChannelLocation::TopSurroundLeft,
+            _ => return None,
+        })
+    }
+
+    /// `true` for the two low-frequency-effects locations — `LFE`
+    /// (Table E2.5 bit 15) and `LFE2` (bit 14). Lets a §7.8 downmix
+    /// router or a WAVE-mask reorderer route the band-limited LFE feed
+    /// to the dedicated `LOW_FREQUENCY` speaker slot without re-walking
+    /// the location list.
+    pub fn is_lfe(self) -> bool {
+        matches!(self, ChannelLocation::Lfe | ChannelLocation::Lfe2)
+    }
+
+    /// `true` for the height-plane locations — the `Vhl/Vhr` pair
+    /// (bit 11), `Vhc` (bit 12), and the `Lts/Rts` top-surround pair
+    /// (bit 13), plus the single `Ts` top-surround (bit 8). These are
+    /// the Table E2.5 rows that sit above the listener plane per
+    /// SMPTE 428-3, distinguishing them from the ear-level surround
+    /// rows for an immersive-capable renderer.
+    pub fn is_height(self) -> bool {
+        matches!(
+            self,
+            ChannelLocation::TopSurround
+                | ChannelLocation::VerticalHeightLeft
+                | ChannelLocation::VerticalHeightRight
+                | ChannelLocation::VerticalHeightCenter
+                | ChannelLocation::TopSurroundLeft
+                | ChannelLocation::TopSurroundRight
+        )
+    }
+
+    /// `true` for the ear-level surround locations — the base `Ls/Rs`
+    /// pair (bits 3, 4), the `Cs` center-surround (bit 7), the
+    /// `Lrs/Rrs` rear-surround pair (bit 6), and the `Lsd/Rsd`
+    /// surround-direct pair (bit 9). Excludes the height-plane surround
+    /// rows (see [`Self::is_height`]) and the front / wide rows.
+    pub fn is_surround(self) -> bool {
+        matches!(
+            self,
+            ChannelLocation::LeftSurround
+                | ChannelLocation::RightSurround
+                | ChannelLocation::CenterSurround
+                | ChannelLocation::LeftRearSurround
+                | ChannelLocation::RightRearSurround
+                | ChannelLocation::LeftSurroundDirect
+                | ChannelLocation::RightSurroundDirect
+        )
+    }
+}
+
 /// Errors raised by the chanmap decoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChanmapError {
@@ -299,6 +463,216 @@ mod tests {
         ];
         for (i, &want) in expected.iter().enumerate() {
             assert_eq!(locs[i], want, "single-bit slot {i}");
+        }
+    }
+
+    /// `ChannelLocation::ALL` lists exactly the 22 distinct variants in
+    /// Table E2.5 bit order (pair-bits expanded left-then-right), with no
+    /// duplicates and no omissions.
+    #[test]
+    fn all_lists_every_variant_in_table_order() {
+        // 16 location bits, 6 of which are pairs → 16 + 6 = 22 entries.
+        assert_eq!(ChannelLocation::ALL.len(), 22);
+        // The bit indices are non-decreasing across the list (pair halves
+        // share a bit; everything else strictly increases).
+        let mut prev = 0u8;
+        for (i, loc) in ChannelLocation::ALL.iter().enumerate() {
+            let bit = loc.table_e2_5_bit();
+            if i > 0 {
+                assert!(bit >= prev, "ALL not in bit order at index {i}");
+            }
+            prev = bit;
+        }
+        // No duplicate variants.
+        for (i, a) in ChannelLocation::ALL.iter().enumerate() {
+            for b in &ChannelLocation::ALL[i + 1..] {
+                assert_ne!(a, b, "duplicate variant in ALL");
+            }
+        }
+    }
+
+    /// `table_e2_5_bit` maps each variant to its Table E2.5 row; both
+    /// halves of a pair-bit share the row's single bit index.
+    #[test]
+    fn table_e2_5_bit_maps_each_row() {
+        assert_eq!(ChannelLocation::Left.table_e2_5_bit(), 0);
+        assert_eq!(ChannelLocation::Center.table_e2_5_bit(), 1);
+        assert_eq!(ChannelLocation::Right.table_e2_5_bit(), 2);
+        assert_eq!(ChannelLocation::LeftSurround.table_e2_5_bit(), 3);
+        assert_eq!(ChannelLocation::RightSurround.table_e2_5_bit(), 4);
+        // Pair bit 5 — both halves share bit 5.
+        assert_eq!(ChannelLocation::LeftCenter.table_e2_5_bit(), 5);
+        assert_eq!(ChannelLocation::RightCenter.table_e2_5_bit(), 5);
+        // Pair bit 6.
+        assert_eq!(ChannelLocation::LeftRearSurround.table_e2_5_bit(), 6);
+        assert_eq!(ChannelLocation::RightRearSurround.table_e2_5_bit(), 6);
+        assert_eq!(ChannelLocation::CenterSurround.table_e2_5_bit(), 7);
+        assert_eq!(ChannelLocation::TopSurround.table_e2_5_bit(), 8);
+        assert_eq!(ChannelLocation::LeftSurroundDirect.table_e2_5_bit(), 9);
+        assert_eq!(ChannelLocation::RightSurroundDirect.table_e2_5_bit(), 9);
+        assert_eq!(ChannelLocation::LeftWide.table_e2_5_bit(), 10);
+        assert_eq!(ChannelLocation::RightWide.table_e2_5_bit(), 10);
+        assert_eq!(ChannelLocation::VerticalHeightLeft.table_e2_5_bit(), 11);
+        assert_eq!(ChannelLocation::VerticalHeightRight.table_e2_5_bit(), 11);
+        assert_eq!(ChannelLocation::VerticalHeightCenter.table_e2_5_bit(), 12);
+        assert_eq!(ChannelLocation::TopSurroundLeft.table_e2_5_bit(), 13);
+        assert_eq!(ChannelLocation::TopSurroundRight.table_e2_5_bit(), 13);
+        assert_eq!(ChannelLocation::Lfe2.table_e2_5_bit(), 14);
+        assert_eq!(ChannelLocation::Lfe.table_e2_5_bit(), 15);
+    }
+
+    /// `chanmap_weight` places bit 0 (Left) in the MSB and bit 15 (LFE)
+    /// in the LSB per §E.2.3.1.8; pair halves share the single weight.
+    #[test]
+    fn chanmap_weight_msb_first() {
+        assert_eq!(ChannelLocation::Left.chanmap_weight(), 0x8000);
+        assert_eq!(ChannelLocation::Lfe.chanmap_weight(), 0x0001);
+        // Bit 6 → weight 1 << (15 - 6) = 0x0200; both halves agree.
+        assert_eq!(ChannelLocation::LeftRearSurround.chanmap_weight(), 0x0200);
+        assert_eq!(ChannelLocation::RightRearSurround.chanmap_weight(), 0x0200);
+    }
+
+    /// A decoded location list re-OR's back into the original `chanmap`
+    /// field via `chanmap_weight` — pair-bits, set once in the source,
+    /// must not be double-counted (both halves OR the same weight).
+    #[test]
+    fn chanmap_weight_round_trips_decoded_list() {
+        // Spec example #2: bits 3, 4, 6 set on a 4-channel dep substream.
+        let chanmap = 0x1000 | 0x0800 | 0x0200;
+        let locs = expand_chanmap_locations(chanmap, 4).unwrap();
+        let reconstructed = locs
+            .iter()
+            .fold(0u16, |acc, loc| acc | loc.chanmap_weight());
+        assert_eq!(reconstructed, chanmap);
+
+        // A map with two pair-bits + a single bit (bits 0, 6, 9 →
+        // Left + Lrs/Rrs + Lsd/Rsd = 5 coded channels).
+        let chanmap = 0x8000 | 0x0200 | 0x0040;
+        let locs = expand_chanmap_locations(chanmap, 5).unwrap();
+        let reconstructed = locs
+            .iter()
+            .fold(0u16, |acc, loc| acc | loc.chanmap_weight());
+        assert_eq!(reconstructed, chanmap);
+    }
+
+    /// `is_pair_half` is true exactly for the 12 expanded halves of the
+    /// 6 Table E2.5 pair-bits, and `pair_companion` returns the other
+    /// half (and `None` for single-channel locations).
+    #[test]
+    fn pair_half_and_companion() {
+        let pair_halves = [
+            (ChannelLocation::LeftCenter, ChannelLocation::RightCenter),
+            (
+                ChannelLocation::LeftRearSurround,
+                ChannelLocation::RightRearSurround,
+            ),
+            (
+                ChannelLocation::LeftSurroundDirect,
+                ChannelLocation::RightSurroundDirect,
+            ),
+            (ChannelLocation::LeftWide, ChannelLocation::RightWide),
+            (
+                ChannelLocation::VerticalHeightLeft,
+                ChannelLocation::VerticalHeightRight,
+            ),
+            (
+                ChannelLocation::TopSurroundLeft,
+                ChannelLocation::TopSurroundRight,
+            ),
+        ];
+        let mut pair_count = 0;
+        for (l, r) in pair_halves {
+            assert!(l.is_pair_half());
+            assert!(r.is_pair_half());
+            assert_eq!(l.pair_companion(), Some(r));
+            assert_eq!(r.pair_companion(), Some(l));
+            // Companions share the Table E2.5 bit.
+            assert_eq!(l.table_e2_5_bit(), r.table_e2_5_bit());
+            pair_count += 2;
+        }
+        assert_eq!(pair_count, 12);
+
+        // Single-channel locations are not pair halves and have no
+        // companion.
+        for loc in [
+            ChannelLocation::Left,
+            ChannelLocation::Center,
+            ChannelLocation::CenterSurround,
+            ChannelLocation::VerticalHeightCenter,
+            ChannelLocation::Lfe,
+            ChannelLocation::Lfe2,
+        ] {
+            assert!(!loc.is_pair_half());
+            assert_eq!(loc.pair_companion(), None);
+        }
+    }
+
+    /// `is_lfe` flags only the two LFE rows (bits 14, 15).
+    #[test]
+    fn is_lfe_flags_lfe_rows() {
+        assert!(ChannelLocation::Lfe.is_lfe());
+        assert!(ChannelLocation::Lfe2.is_lfe());
+        for loc in ChannelLocation::ALL {
+            if !matches!(loc, ChannelLocation::Lfe | ChannelLocation::Lfe2) {
+                assert!(!loc.is_lfe(), "{loc:?} should not be LFE");
+            }
+        }
+    }
+
+    /// `is_height` flags exactly the SMPTE 428-3 above-plane rows: Ts
+    /// (bit 8), Vhl/Vhr (bit 11), Vhc (bit 12), Lts/Rts (bit 13).
+    #[test]
+    fn is_height_flags_above_plane_rows() {
+        let height = [
+            ChannelLocation::TopSurround,
+            ChannelLocation::VerticalHeightLeft,
+            ChannelLocation::VerticalHeightRight,
+            ChannelLocation::VerticalHeightCenter,
+            ChannelLocation::TopSurroundLeft,
+            ChannelLocation::TopSurroundRight,
+        ];
+        for loc in ChannelLocation::ALL {
+            let want = height.contains(&loc);
+            assert_eq!(loc.is_height(), want, "{loc:?} height classification");
+        }
+        // Height and LFE are disjoint; height and ear-level surround are
+        // disjoint.
+        for loc in ChannelLocation::ALL {
+            if loc.is_height() {
+                assert!(!loc.is_lfe());
+                assert!(!loc.is_surround());
+            }
+        }
+    }
+
+    /// `is_surround` flags the ear-level surround rows (Ls/Rs, Cs,
+    /// Lrs/Rrs, Lsd/Rsd) and excludes the height and front rows.
+    #[test]
+    fn is_surround_flags_ear_level_rows() {
+        let surround = [
+            ChannelLocation::LeftSurround,
+            ChannelLocation::RightSurround,
+            ChannelLocation::CenterSurround,
+            ChannelLocation::LeftRearSurround,
+            ChannelLocation::RightRearSurround,
+            ChannelLocation::LeftSurroundDirect,
+            ChannelLocation::RightSurroundDirect,
+        ];
+        for loc in ChannelLocation::ALL {
+            let want = surround.contains(&loc);
+            assert_eq!(loc.is_surround(), want, "{loc:?} surround classification");
+        }
+        // Front rows are neither surround nor height nor LFE.
+        for loc in [
+            ChannelLocation::Left,
+            ChannelLocation::Center,
+            ChannelLocation::Right,
+            ChannelLocation::LeftCenter,
+            ChannelLocation::RightCenter,
+        ] {
+            assert!(!loc.is_surround());
+            assert!(!loc.is_height());
+            assert!(!loc.is_lfe());
         }
     }
 }
