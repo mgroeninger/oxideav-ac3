@@ -541,6 +541,27 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       reserved-code `None` short-circuits, the `parse()` → typed surface
       agreement on 48 / 32 kHz frames, and the hand-built
       reserved-frmsizecod surfacing path). 277 lib tests, all green.
+      **Round 278** lifts the Annex E §E.2.3.1.12-17 program-scale-factor
+      trio — `pgmscl` (the substream's own program), `pgmscl2` (the
+      second channel of a 1+1 dual-mono program), and `extpgmscl` (an
+      *external* program carried in a different bit stream / independent
+      substream, "same scale as pgmscl" per §E.2.3.1.17) — from
+      parse-and-discard to typed `Eac3Bsi::pgmscl` / `pgmscl2` /
+      `extpgmscl` fields (`Option<ProgramScaleFactor>`). The newtype
+      implements the §E.2.3.1.13 wire scale: codepoint `0` = mute,
+      `1..=63` → `-50..=+12 dB` in 1 dB steps (`decibels() = code − 51`,
+      unity at `51`), with `from_code` / `raw()` round-trip, `is_mute()`,
+      `decibels() -> Option<i8>`, and `linear() -> f32` for a §E.3.10
+      dual-decoder mixer to consume directly. `Some` only when
+      `mixmdate == 1` on an independent substream (Table E1.2 emits the
+      chain under `strmtyp == 0x0` only) with the respective exists-flag
+      set; `None` means "0 dB (no scaling)" per §E.2.3.1.12/.14/.16. Per
+      §E.3.10.1-2 the gains apply during the main + associated-service
+      mixing process, so the single-stream decode PCM path is unchanged
+      and encoder output stays byte-identical (`mixmdate == 0`). Covered
+      by 8 new `eac3::bsi::tests` including both §E.3.10 worked-example
+      gains (-3 dB / -10 dB) round-tripped through `parse()` with cursor
+      checks. 285 → 293 lib tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

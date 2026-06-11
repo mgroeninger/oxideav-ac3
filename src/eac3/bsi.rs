@@ -105,6 +105,72 @@ impl StreamType {
     }
 }
 
+/// §E.2.3.1.12-17 program scale factor — the 6-bit gain word an
+/// independent substream's mixing-metadata block can attach to its
+/// own program (`pgmscl`, §E.2.3.1.13), to the second program of a
+/// 1+1 dual-mono stream (`pgmscl2`, §E.2.3.1.15), or to an
+/// *external* program carried in a different bit stream /
+/// independent substream (`extpgmscl`, §E.2.3.1.17 — "this field
+/// shall use the same scale as pgmscl").
+///
+/// Wire scale per §E.2.3.1.13: the value `0` shall be interpreted
+/// as **mute**, and the values `1..=63` as a scale factor of
+/// `-50 dB` to `+12 dB` in 1 dB steps — i.e.
+/// `decibels() == code - 51`, with the `51` codepoint at 0 dB
+/// (unity). When the corresponding exists-flag (`pgmscle` /
+/// `pgmscl2e` / `extpgmscle`) is `0`, "the program scale factor
+/// shall be 0 dB (no scaling)" per §E.2.3.1.12/.14/.16 — the BSI
+/// fields represent that absent state as `None`.
+///
+/// Per §E.3.10.1-2 the gain is applied "during the mixing process"
+/// of a dual-decoder main + associated-service mixer (`pgmscl`
+/// attenuates the program carried in the *same* substream;
+/// `extpgmscl` attenuates the program carried in a *different*
+/// bit stream or independent substream). The single-stream decode
+/// path is unchanged — this is pure surfaced metadata for a
+/// downstream §E.3.10 mixer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgramScaleFactor(u8);
+
+impl ProgramScaleFactor {
+    /// Wraps a 6-bit wire codepoint. The upper two bits of `code`
+    /// are ignored so a caller can pass a wider word verbatim.
+    pub fn from_code(code: u8) -> Self {
+        Self(code & 0x3F)
+    }
+
+    /// The raw 6-bit codepoint (`0..=63`) for bit-stream round-trip.
+    pub fn raw(self) -> u8 {
+        self.0
+    }
+
+    /// `true` for the `0` codepoint — §E.2.3.1.13 "the value 0 shall
+    /// be interpreted as mute".
+    pub fn is_mute(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The scale factor in dB: `Some(code - 51)` spanning `-50..=+12`
+    /// for the codepoints `1..=63`; `None` for the mute codepoint,
+    /// which has no finite dB value.
+    pub fn decibels(self) -> Option<i8> {
+        if self.0 == 0 {
+            None
+        } else {
+            Some(self.0 as i8 - 51)
+        }
+    }
+
+    /// Linear amplitude scale a §E.3.10 mixer multiplies the program
+    /// by: `0.0` for the mute codepoint, otherwise `10^(dB / 20)`.
+    pub fn linear(self) -> f32 {
+        match self.decibels() {
+            None => 0.0,
+            Some(db) => 10f32.powf(f32::from(db) / 20.0),
+        }
+    }
+}
+
 /// Parsed E-AC-3 BSI — the subset actually needed by the round-1
 /// decoder + dispatcher. Fields not surfaced are still parsed (the
 /// bit cursor walk has to land at the start of `audfrm()`).
@@ -201,6 +267,30 @@ pub struct Bsi {
     /// downstream tooling and a future LFE-into-stereo bass-route can
     /// honour it without re-parsing the BSI.
     pub lfemixlevcod: Option<u8>,
+    /// §E.2.3.1.12-13 program scale factor (`pgmscl`) — the gain a
+    /// §E.3.10 dual-decoder mixer applies to the program carried in
+    /// *this* substream while mixing it with an associated service.
+    /// `Some` only when `mixmdate == 1`, the substream is independent
+    /// (Table E1.2 emits the `pgmscle` chain under
+    /// `strmtyp == 0x0` only), AND `pgmscle == 1`; `None` otherwise —
+    /// per §E.2.3.1.12 the absent state means "0 dB (no scaling)".
+    /// See [`ProgramScaleFactor`] for the mute / `-50..=+12 dB` wire
+    /// scale. The single-stream decode path does not consult it.
+    pub pgmscl: Option<ProgramScaleFactor>,
+    /// §E.2.3.1.14-15 program scale factor #2 (`pgmscl2`) — same
+    /// scale as [`Bsi::pgmscl`] but applying to the second audio
+    /// channel when `acmod` indicates two independent channels (1+1
+    /// dual mono). `Some` only when `mixmdate == 1`, the substream is
+    /// independent, `acmod == 0`, AND `pgmscl2e == 1`.
+    pub pgmscl2: Option<ProgramScaleFactor>,
+    /// §E.2.3.1.16-17 external program scale factor (`extpgmscl`) —
+    /// the gain a §E.3.10 mixer applies to an *external* program (one
+    /// carried in a separate bit stream or independent substream from
+    /// the one carrying this instance). Same wire scale as
+    /// [`Bsi::pgmscl`] per §E.2.3.1.17. `Some` only when
+    /// `mixmdate == 1`, the substream is independent, AND
+    /// `extpgmscle == 1`.
+    pub extpgmscl: Option<ProgramScaleFactor>,
     /// Heavy compression gain word (`compr`, §E.2.3.1.x / §5.4.2.10 +
     /// §7.7.2.2 reused per Annex E). Identical semantics + wire format
     /// to base AC-3 — see [`CompressionGain`] for the X/Y decode. For
@@ -463,12 +553,20 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         None
     };
 
-    // §E.2.3.1.9-21 — mixing meta-data block.
+    // §E.2.3.1.9-61 — mixing meta-data block.
     let mixmdate = br.read_u32(1)? != 0;
-    let (annex_e_mix_levels, dmixmod, dmixmod_preference, lfemixlevcod) = if mixmdate {
+    let MixingMetadata {
+        annex_e_mix_levels,
+        dmixmod,
+        dmixmod_preference,
+        lfemixlevcod,
+        pgmscl,
+        pgmscl2,
+        extpgmscl,
+    } = if mixmdate {
         parse_mixing_metadata(br, acmod, lfeon, strmtyp, numblkscod)?
     } else {
-        (None, 0xFFu8, None, None)
+        MixingMetadata::ABSENT
     };
 
     // §E.2.3.1.62 ff — informational meta-data.
@@ -540,6 +638,9 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         dmixmod,
         dmixmod_preference,
         lfemixlevcod,
+        pgmscl,
+        pgmscl2,
+        extpgmscl,
         compr,
         compr_ch2,
         dsurexmod,
@@ -556,32 +657,48 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
     })
 }
 
-/// Walk the §E.2.3.1.9-61 mixing metadata block exactly per Table
-/// E1.2. Captures the four downmix mix-level codewords plus `dmixmod`
-/// and `lfemixlevcod`; every other field is consumed bit-accurately and
-/// discarded. Errors propagate when the bit-reader runs out of input.
-///
-/// Returns `(annex_e_mix_levels, dmixmod, lfemixlevcod)`. Per the
-/// spec's per-channel guards (Table E1.2):
+/// Fields the §E.2.3.1.9-61 mixing-metadata walk surfaces to the
+/// public [`Bsi`]. Per the spec's guards (Table E1.2):
 ///  * `dmixmod` is only present when `acmod > 2` (more than 2 channels).
 ///  * `ltrtcmixlev` / `lorocmixlev` only when 3 front channels exist
 ///    (`acmod & 0x1 != 0 && acmod > 2`).
 ///  * `ltrtsurmixlev` / `lorosurmixlev` only when a surround channel
 ///    exists (`acmod & 0x4 != 0`).
 ///  * `lfemixlevcod` only when `lfeon && lfemixlevcode == 1`.
+///  * `pgmscl` / `pgmscl2` / `extpgmscl` only on independent
+///    substreams (`strmtyp == 0x0`) when the respective exists-flag
+///    is set (`pgmscl2` additionally requires `acmod == 0`).
 ///
 /// Codewords whose guards fail read back as `0xFF` inside
 /// [`AnnexDMixLevels`] so callers can distinguish "spec-absent" from a
-/// legitimate `0b000` (1.414×) code. The returned `Option` itself is
-/// `None` only when none of the four center/surround fields were
-/// present (mono / 2/0 stereo with no surrounds) — those layouts have
-/// no downmix to refine.
-type MixingMetadata = (
-    Option<AnnexDMixLevels>,
-    u8,
-    Option<StereoDownmixPreference>,
-    Option<u8>,
-);
+/// legitimate `0b000` (1.414×) code. The `annex_e_mix_levels` `Option`
+/// itself is `None` only when none of the four center/surround fields
+/// were present (mono / 2/0 stereo with no surrounds) — those layouts
+/// have no downmix to refine.
+struct MixingMetadata {
+    annex_e_mix_levels: Option<AnnexDMixLevels>,
+    dmixmod: u8,
+    dmixmod_preference: Option<StereoDownmixPreference>,
+    lfemixlevcod: Option<u8>,
+    pgmscl: Option<ProgramScaleFactor>,
+    pgmscl2: Option<ProgramScaleFactor>,
+    extpgmscl: Option<ProgramScaleFactor>,
+}
+
+impl MixingMetadata {
+    /// The `mixmdate == 0` state — every surfaced field absent (the
+    /// program scale factors default to "0 dB, no scaling" per
+    /// §E.2.3.1.12/.14/.16, represented as `None`).
+    const ABSENT: Self = Self {
+        annex_e_mix_levels: None,
+        dmixmod: 0xFF,
+        dmixmod_preference: None,
+        lfemixlevcod: None,
+        pgmscl: None,
+        pgmscl2: None,
+        extpgmscl: None,
+    };
+}
 
 fn parse_mixing_metadata(
     br: &mut BitReader<'_>,
@@ -637,20 +754,30 @@ fn parse_mixing_metadata(
     };
     // strmtyp == 0x0 (independent) emits pgmscle/pgmscl + extpgmscle/
     // extpgmscl + mixdef + (mixdef-dependent body).
+    let mut pgmscl = None;
+    let mut pgmscl2 = None;
+    let mut extpgmscl = None;
     if matches!(strmtyp, StreamType::Independent) {
+        // §E.2.3.1.12-13 — program scale factor for this substream's
+        // own program. Absent ⇒ 0 dB (no scaling).
         let pgmscle = br.read_u32(1)? != 0;
         if pgmscle {
-            let _pgmscl = br.read_u32(6)?;
+            pgmscl = Some(ProgramScaleFactor::from_code(br.read_u32(6)? as u8));
         }
         if acmod == 0 {
+            // §E.2.3.1.14-15 — same meaning as pgmscl, applied to the
+            // second channel of a 1+1 dual-mono program.
             let pgmscl2e = br.read_u32(1)? != 0;
             if pgmscl2e {
-                let _pgmscl2 = br.read_u32(6)?;
+                pgmscl2 = Some(ProgramScaleFactor::from_code(br.read_u32(6)? as u8));
             }
         }
+        // §E.2.3.1.16-17 — scale factor for an *external* program
+        // (carried in a different bit stream / independent substream),
+        // same wire scale as pgmscl.
         let extpgmscle = br.read_u32(1)? != 0;
         if extpgmscle {
-            let _extpgmscl = br.read_u32(6)?;
+            extpgmscl = Some(ProgramScaleFactor::from_code(br.read_u32(6)? as u8));
         }
         let mixdef = br.read_u32(2)?;
         match mixdef {
@@ -732,12 +859,15 @@ fn parse_mixing_metadata(
             }
         }
     }
-    Ok((
+    Ok(MixingMetadata {
         annex_e_mix_levels,
         dmixmod,
         dmixmod_preference,
         lfemixlevcod,
-    ))
+        pgmscl,
+        pgmscl2,
+        extpgmscl,
+    })
 }
 
 /// Parses the body of `mixdata2e` (mixing option 4 with extra channel
@@ -2161,5 +2291,241 @@ mod tests {
         assert_eq!(bsi.acmod, 7);
         assert!(bsi.dialnorm_ch2.is_none());
         assert!(bsi.dialogue_normalization_ch2().is_none());
+    }
+
+    /// Round 278 — §E.2.3.1.13 wire scale: the `0` codepoint is mute
+    /// (no finite dB value, linear gain 0.0).
+    #[test]
+    fn program_scale_factor_mute_codepoint() {
+        let psf = ProgramScaleFactor::from_code(0);
+        assert!(psf.is_mute());
+        assert_eq!(psf.raw(), 0);
+        assert_eq!(psf.decibels(), None);
+        assert_eq!(psf.linear(), 0.0);
+    }
+
+    /// §E.2.3.1.13 — codepoints `1..=63` map to `-50..=+12 dB` in
+    /// 1 dB steps (`code - 51`; `51` is unity). Check every codepoint
+    /// plus the spec's stated endpoints and the linear derivations.
+    #[test]
+    fn program_scale_factor_db_mapping_all_codepoints() {
+        for code in 1u8..=63 {
+            let psf = ProgramScaleFactor::from_code(code);
+            assert!(!psf.is_mute());
+            assert_eq!(psf.raw(), code);
+            assert_eq!(psf.decibels(), Some(code as i8 - 51), "code {code}");
+        }
+        // Spec endpoints: "the values 1–63 shall be interpreted as a
+        // scale factor of –50 dB to +12 dB in 1 dB steps".
+        assert_eq!(ProgramScaleFactor::from_code(1).decibels(), Some(-50));
+        assert_eq!(ProgramScaleFactor::from_code(63).decibels(), Some(12));
+        // Unity at the 0 dB codepoint.
+        let unity = ProgramScaleFactor::from_code(51);
+        assert_eq!(unity.decibels(), Some(0));
+        assert!((unity.linear() - 1.0).abs() < 1e-6);
+        // Linear endpoints: 10^(-50/20) ≈ 0.0031623, 10^(12/20) ≈ 3.9811.
+        assert!((ProgramScaleFactor::from_code(1).linear() - 0.003_162_3).abs() < 1e-6);
+        assert!((ProgramScaleFactor::from_code(63).linear() - 3.981_07).abs() < 1e-4);
+    }
+
+    /// `from_code` masks to the 6-bit wire width so a caller can pass
+    /// a wider word verbatim.
+    #[test]
+    fn program_scale_factor_from_code_masks_upper_bits() {
+        assert_eq!(ProgramScaleFactor::from_code(0xFF).raw(), 0x3F);
+        assert!(ProgramScaleFactor::from_code(0x40).is_mute());
+        assert_eq!(
+            ProgramScaleFactor::from_code(0x73),
+            ProgramScaleFactor::from_code(0x33)
+        );
+    }
+
+    /// Round 278 — an independent 3/2+LFE syncframe with
+    /// `mixmdate == 1`, `pgmscle == 1` (-3 dB — the §E.3.10.1 worked
+    /// example) and `extpgmscle == 1` (-10 dB — the §E.3.10.2 worked
+    /// example) surfaces both typed scale factors; `pgmscl2` stays
+    /// `None` outside 1+1 dual mono.
+    #[test]
+    fn parse_surfaces_pgmscl_and_extpgmscl_annex_e() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = independent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod = 3 → 6 blocks
+            (3, 7),    // acmod = 7 (3/2)
+            (1, 1),    // lfeon = 1
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 1),    // mixmdate = 1
+            // mixmdata body (acmod = 7, lfeon = 1, independent):
+            (2, 0),  // dmixmod
+            (3, 2),  // ltrtcmixlev
+            (3, 4),  // lorocmixlev
+            (3, 3),  // ltrtsurmixlev
+            (3, 5),  // lorosurmixlev
+            (1, 0),  // lfemixlevcode = 0
+            (1, 1),  // pgmscle = 1
+            (6, 48), // pgmscl = 48 → -3 dB (§E.3.10.1 example)
+            (1, 1),  // extpgmscle = 1
+            (6, 41), // extpgmscl = 41 → -10 dB (§E.3.10.2 example)
+            (2, 0),  // mixdef = 0
+            (1, 0),  // frmmixcfginfoe
+            (1, 0),  // infomdate
+            (1, 0),  // addbsie
+        ];
+        let (buf, total_bits) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        let pgmscl = bsi.pgmscl.expect("pgmscle == 1 surfaces pgmscl");
+        assert_eq!(pgmscl.raw(), 48);
+        assert_eq!(pgmscl.decibels(), Some(-3));
+        assert!(bsi.pgmscl2.is_none(), "no pgmscl2 outside 1+1 dual mono");
+        let ext = bsi.extpgmscl.expect("extpgmscle == 1 surfaces extpgmscl");
+        assert_eq!(ext.raw(), 41);
+        assert_eq!(ext.decibels(), Some(-10));
+        assert_eq!(bsi.bits_consumed, total_bits);
+    }
+
+    /// 1+1 dual-mono (`acmod == 0`) independent substream — the
+    /// §E.2.3.1.14-15 `pgmscl2` slot is on the wire and surfaces
+    /// independently of `pgmscl`; the mute codepoint (`0`) survives
+    /// the round-trip.
+    #[test]
+    fn parse_surfaces_pgmscl2_on_dual_mono_annex_e() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = independent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 0),    // acmod = 0 (1+1 dual mono)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (5, 28),   // dialnorm2 (acmod == 0)
+            (1, 0),    // compr2e
+            (1, 1),    // mixmdate = 1
+            // mixmdata body (acmod = 0 → no dmixmod / mix levels;
+            // lfeon = 0 → no lfemixlevcode):
+            (1, 1),  // pgmscle = 1
+            (6, 51), // pgmscl = 51 → 0 dB unity
+            (1, 1),  // pgmscl2e = 1
+            (6, 0),  // pgmscl2 = 0 → mute
+            (1, 0),  // extpgmscle = 0
+            (2, 0),  // mixdef = 0
+            (1, 0),  // paninfoe (acmod < 2)
+            (1, 0),  // paninfo2e (acmod == 0)
+            (1, 0),  // frmmixcfginfoe
+            (1, 0),  // infomdate
+            (1, 0),  // addbsie
+        ];
+        let (buf, total_bits) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        let pgmscl = bsi.pgmscl.expect("pgmscle == 1");
+        assert_eq!(pgmscl.decibels(), Some(0));
+        let pgmscl2 = bsi.pgmscl2.expect("pgmscl2e == 1");
+        assert!(pgmscl2.is_mute());
+        assert!(bsi.extpgmscl.is_none(), "extpgmscle == 0 ⇒ 0 dB default");
+        assert_eq!(bsi.bits_consumed, total_bits);
+    }
+
+    /// `mixmdate == 1` with all three exists-flags clear — per
+    /// §E.2.3.1.12/.14/.16 the scale factors default to "0 dB (no
+    /// scaling)", represented as `None` on every field.
+    #[test]
+    fn parse_leaves_program_scale_factors_none_when_exists_flags_clear() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = independent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 2),    // acmod = 2 (2/0)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 1),    // mixmdate = 1
+            // mixmdata body for 2/0 indep:
+            (1, 0), // pgmscle = 0
+            (1, 0), // extpgmscle = 0
+            (2, 0), // mixdef
+            (1, 0), // frmmixcfginfoe
+            (1, 0), // infomdate
+            (1, 0), // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert!(bsi.pgmscl.is_none());
+        assert!(bsi.pgmscl2.is_none());
+        assert!(bsi.extpgmscl.is_none());
+    }
+
+    /// `mixmdate == 0` skips the whole mixing-metadata block — all
+    /// three program scale factors stay `None` regardless of layout.
+    #[test]
+    fn parse_leaves_program_scale_factors_none_when_mixmdate_clear() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),
+            (3, 0),
+            (11, 383),
+            (2, 0),
+            (2, 3),
+            (3, 7), // acmod = 7
+            (1, 1), // lfeon
+            (5, 16),
+            (5, 27),
+            (1, 0), // compre
+            (1, 0), // mixmdate = 0
+            (1, 0), // infomdate
+            (1, 0), // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert!(bsi.pgmscl.is_none());
+        assert!(bsi.pgmscl2.is_none());
+        assert!(bsi.extpgmscl.is_none());
+    }
+
+    /// Dependent substreams never carry the program-scale-factor
+    /// chain — Table E1.2 emits `pgmscle` … `extpgmscl` under
+    /// `strmtyp == 0x0` only. A dependent substream with
+    /// `mixmdate == 1` still surfaces the mix-level codewords but
+    /// leaves all three scale factors `None`.
+    #[test]
+    fn parse_skips_program_scale_factors_on_dependent_substream() {
+        let bits: &[(u32, u32)] = &[
+            (2, 1),    // strmtyp = dependent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 7),    // acmod = 7 (3/2)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // chanmape (dependent-only flag)
+            (1, 1),    // mixmdate = 1
+            // mixmdata body for dependent 3/2: dmixmod + four mix
+            // levels only — no indep pgmscl/extpgmscl/mixdef tail.
+            (2, 1), // dmixmod = LtRt preferred
+            (3, 2), // ltrtcmixlev
+            (3, 4), // lorocmixlev
+            (3, 3), // ltrtsurmixlev
+            (3, 5), // lorosurmixlev
+            (1, 0), // infomdate
+            (1, 0), // addbsie
+        ];
+        let (buf, total_bits) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert_eq!(bsi.strmtyp, StreamType::Dependent);
+        assert!(bsi.annex_e_mix_levels.is_some());
+        assert!(bsi.pgmscl.is_none());
+        assert!(bsi.pgmscl2.is_none());
+        assert!(bsi.extpgmscl.is_none());
+        assert_eq!(bsi.bits_consumed, total_bits);
     }
 }

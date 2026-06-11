@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 §E.2.3.1.12-17 program-scale-factor typed surface —
+  `ProgramScaleFactor`** (round 278 / r278). The three 6-bit gain words
+  an independent substream's mixing-metadata block can carry — `pgmscl`
+  (§E.2.3.1.13, the substream's own program), `pgmscl2` (§E.2.3.1.15,
+  the second channel of a 1+1 dual-mono program), and `extpgmscl`
+  (§E.2.3.1.17, an *external* program carried in a different bit stream
+  / independent substream, "same scale as pgmscl") — lift from
+  parse-and-discard to typed `Eac3Bsi::pgmscl` / `Eac3Bsi::pgmscl2` /
+  `Eac3Bsi::extpgmscl` fields (`Option<ProgramScaleFactor>`). The
+  `ProgramScaleFactor` newtype implements the §E.2.3.1.13 wire scale:
+  codepoint `0` is **mute**, codepoints `1..=63` map to `-50..=+12 dB`
+  in 1 dB steps (`decibels() == code - 51`, the `51` codepoint at 0 dB
+  unity), with `from_code(u8)` (6-bit masking so a wider word can be
+  passed verbatim) / `raw()` round-trip, `is_mute()`, `decibels() ->
+  Option<i8>` (`None` for the mute codepoint, which has no finite dB
+  value), and `linear() -> f32` (`0.0` mute, else `10^(dB/20)`) for a
+  §E.3.10 mixer to consume directly. `Some` only when `mixmdate == 1`,
+  the substream is independent (Table E1.2 emits the chain under
+  `strmtyp == 0x0` only), AND the respective exists-flag is set
+  (`pgmscl2` additionally requires `acmod == 0`); `None` otherwise —
+  per §E.2.3.1.12/.14/.16 the absent state means "0 dB (no scaling)".
+  Per §E.3.10.1-2 the gains apply "during the mixing process" of a
+  dual-decoder main + associated-service mixer, so the single-stream
+  decode PCM path is unchanged; surfacing them lets a downstream
+  §E.3.10 mixer attenuate the main service per the associated
+  substream's instruction without re-parsing the BSI. The internal
+  `parse_mixing_metadata` return grew from a 4-tuple to a named
+  `MixingMetadata` struct in the process. Encoders still emit
+  `mixmdate == 0` so encoder output is byte-identical; the only
+  behaviour change is decoder-side parsing. Covered by 8 new
+  `eac3::bsi::tests` (the mute codepoint, the full `1..=63` →
+  `code - 51` dB mapping with the spec's -50/+12 endpoints + unity +
+  linear endpoint derivations, the 6-bit `from_code` masking, an indep
+  3/2+LFE `parse()` round-trip carrying the §E.3.10.1 -3 dB and
+  §E.3.10.2 -10 dB worked-example values with `bits_consumed` cursor
+  check, a 1+1 dual-mono round-trip surfacing `pgmscl2` (mute) past
+  the `dialnorm2`/`compr2e` chain, the exists-flags-clear default, the
+  `mixmdate == 0` short-circuit, and the dependent-substream guard
+  that surfaces mix levels but no scale factors). 285 → 293 lib tests,
+  all green.
+
 - **E-AC-3 §E.2.3.1.8 / Table E2.5 `ChannelLocation` classification
   surface** (round 274 / r274). The `chanmap` custom-channel-map decoder
   (`eac3::chanmap`) already expanded the 16-bit field into an ordered
