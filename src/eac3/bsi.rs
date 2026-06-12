@@ -171,6 +171,150 @@ impl ProgramScaleFactor {
     }
 }
 
+/// §E.2.3.1.53-58 pan information — the 8-bit mean-direction index
+/// (`panmean`, §E.2.3.1.54) plus the 6-bit reserved trailer
+/// (`paninfo`, §E.2.3.1.55) an independent mono / 1+1 dual-mono
+/// substream's mixing-metadata block can attach so a §E.3.10.8
+/// dual-decoder mixer pans the mono associated-audio program across
+/// the channels of the main audio service.
+///
+/// Wire scale per §E.2.3.1.54: index `0` points the panned virtual
+/// source toward the **center** speaker location (defined as 0
+/// degrees); each step is 1.5 degrees of clockwise rotation, so
+/// indices `0..=239` span `0..=358.5` degrees while `240..=255` are
+/// reserved. When the exists-flag (`paninfoe` / `paninfo2e`) is `0`
+/// "the pan position word is defaulted to center" per
+/// §E.2.3.1.53/.56 — the BSI fields represent that absent state as
+/// `None` ([`PanInfo::CENTER`] is the equivalent explicit value).
+///
+/// §E.3.10.8 derives per-output-channel scale factors for the
+/// associated program from the index — [`Self::stereo_scale_factors`]
+/// implements the stereo-output table and
+/// [`Self::surround_scale_factors`] the 5.1-output pair of tables
+/// (captioned Tables E3.15-E3.17; the §E.3.10.8 prose cites them
+/// off-by-one as E3.16-E3.18 — the captions are followed here). The
+/// single-stream decode path is unchanged — this is pure surfaced
+/// metadata for a downstream §E.3.10 mixer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PanInfo {
+    panmean: u8,
+    reserved: u8,
+}
+
+impl PanInfo {
+    /// The §E.2.3.1.53/.56 default when the exists-flag is `0`: pan
+    /// position "center" (index 0 → the center speaker location).
+    pub const CENTER: Self = Self {
+        panmean: 0,
+        reserved: 0,
+    };
+
+    /// Wraps the raw wire fields: the 8-bit `panmean` index and the
+    /// 6-bit reserved `paninfo` word (upper bits of `reserved` are
+    /// masked so a caller can pass a wider word verbatim).
+    pub fn from_fields(panmean: u8, reserved: u8) -> Self {
+        Self {
+            panmean,
+            reserved: reserved & 0x3F,
+        }
+    }
+
+    /// The raw 8-bit `panmean` index (`0..=255`) for bit-stream
+    /// round-trip.
+    pub fn panmean(self) -> u8 {
+        self.panmean
+    }
+
+    /// The raw 6-bit reserved `paninfo` field (§E.2.3.1.55 "reserved
+    /// for future mixing applications"), preserved verbatim for
+    /// bit-stream round-trip.
+    pub fn reserved(self) -> u8 {
+        self.reserved
+    }
+
+    /// `true` for the reserved index codepoints `240..=255`
+    /// (§E.2.3.1.54 "values 240 to 255 are reserved").
+    pub fn is_reserved_index(self) -> bool {
+        self.panmean >= 240
+    }
+
+    /// Mean angle of rotation relative to the center position,
+    /// clockwise, in degrees: `Some(panmean × 1.5)` spanning
+    /// `0.0..=358.5` for indices `0..=239`; `None` for the reserved
+    /// indices.
+    pub fn degrees(self) -> Option<f32> {
+        if self.is_reserved_index() {
+            None
+        } else {
+            Some(f32::from(self.panmean) * 1.5)
+        }
+    }
+
+    /// Table E3.15 — associated-audio scale factors `(AL, AR)` for
+    /// stereo-output panning: the mono associated program is split
+    /// into two channels mixed with the main service's Left / Right
+    /// respectively. `None` for the reserved indices. Every
+    /// non-reserved index is power-preserving (`AL² + AR² == 1`).
+    pub fn stereo_scale_factors(self) -> Option<(f32, f32)> {
+        use std::f32::consts::FRAC_PI_2;
+        let p = f32::from(self.panmean);
+        match self.panmean {
+            0..=19 => {
+                let a = FRAC_PI_2 * ((p + 20.0) / 40.0);
+                Some((a.cos(), a.sin()))
+            }
+            20..=99 => Some((0.0, 1.0)),
+            100..=139 => {
+                let a = FRAC_PI_2 * ((p - 100.0) / 40.0);
+                Some((a.sin(), a.cos()))
+            }
+            140..=219 => Some((1.0, 0.0)),
+            220..=239 => {
+                let a = FRAC_PI_2 * ((p - 220.0) / 40.0);
+                Some((a.cos(), a.sin()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Tables E3.16 + E3.17 — associated-audio scale factors
+    /// `[AL, AC, AR, ALS, ARS]` for 5.1-channel-output panning: the
+    /// mono associated program is split into five channels mixed
+    /// with the main service's Left / Center / Right / Left Surround
+    /// / Right Surround respectively (the LFE channel is not
+    /// included per §E.3.10.8). `None` for the reserved indices.
+    /// Every non-reserved index is power-preserving (the five
+    /// squares sum to 1 — each range is a single sin/cos pair across
+    /// two adjacent speakers).
+    pub fn surround_scale_factors(self) -> Option<[f32; 5]> {
+        use std::f32::consts::FRAC_PI_2;
+        let p = f32::from(self.panmean);
+        match self.panmean {
+            0..=19 => {
+                let a = FRAC_PI_2 * (p / 20.0);
+                Some([0.0, a.cos(), a.sin(), 0.0, 0.0])
+            }
+            20..=72 => {
+                let a = FRAC_PI_2 * ((p - 20.0) / 53.0);
+                Some([0.0, 0.0, a.cos(), 0.0, a.sin()])
+            }
+            73..=166 => {
+                let a = FRAC_PI_2 * ((p - 73.0) / 94.0);
+                Some([0.0, 0.0, 0.0, a.sin(), a.cos()])
+            }
+            167..=219 => {
+                let a = FRAC_PI_2 * ((p - 167.0) / 53.0);
+                Some([a.sin(), 0.0, 0.0, a.cos(), 0.0])
+            }
+            220..=239 => {
+                let a = FRAC_PI_2 * ((p - 220.0) / 20.0);
+                Some([a.cos(), a.sin(), 0.0, 0.0, 0.0])
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Parsed E-AC-3 BSI — the subset actually needed by the round-1
 /// decoder + dispatcher. Fields not surfaced are still parsed (the
 /// bit cursor walk has to land at the start of `audfrm()`).
@@ -291,6 +435,25 @@ pub struct Bsi {
     /// `mixmdate == 1`, the substream is independent, AND
     /// `extpgmscle == 1`.
     pub extpgmscl: Option<ProgramScaleFactor>,
+    /// §E.2.3.1.53-55 pan information (`panmean` + the reserved
+    /// `paninfo` trailer) — the mean-direction index a §E.3.10.8
+    /// mixer uses to pan this mono associated-audio program across
+    /// the channels of the main audio service. `Some` only when
+    /// `mixmdate == 1`, the substream is independent (Table E1.2
+    /// emits the chain under `strmtyp == 0x0` only),
+    /// `acmod < 0x2` (mono or 1+1 dual-mono source), AND
+    /// `paninfoe == 1`; `None` otherwise — per §E.2.3.1.53 the
+    /// absent state defaults the pan position word to "center"
+    /// ([`PanInfo::CENTER`]). See [`PanInfo`] for the 1.5-degree
+    /// index scale and the Table E3.15-E3.17 output scale factors.
+    /// The single-stream decode path does not consult it.
+    pub paninfo: Option<PanInfo>,
+    /// §E.2.3.1.56-58 pan information #2 (`panmean2` + `paninfo2`)
+    /// — same meaning as [`Bsi::paninfo`] but applying to the second
+    /// audio channel when `acmod` indicates two independent channels
+    /// (1+1 dual mono). `Some` only when `mixmdate == 1`, the
+    /// substream is independent, `acmod == 0`, AND `paninfo2e == 1`.
+    pub paninfo2: Option<PanInfo>,
     /// Heavy compression gain word (`compr`, §E.2.3.1.x / §5.4.2.10 +
     /// §7.7.2.2 reused per Annex E). Identical semantics + wire format
     /// to base AC-3 — see [`CompressionGain`] for the X/Y decode. For
@@ -563,6 +726,8 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         pgmscl,
         pgmscl2,
         extpgmscl,
+        paninfo,
+        paninfo2,
     } = if mixmdate {
         parse_mixing_metadata(br, acmod, lfeon, strmtyp, numblkscod)?
     } else {
@@ -641,6 +806,8 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         pgmscl,
         pgmscl2,
         extpgmscl,
+        paninfo,
+        paninfo2,
         compr,
         compr_ch2,
         dsurexmod,
@@ -668,6 +835,10 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
 ///  * `pgmscl` / `pgmscl2` / `extpgmscl` only on independent
 ///    substreams (`strmtyp == 0x0`) when the respective exists-flag
 ///    is set (`pgmscl2` additionally requires `acmod == 0`).
+///  * `paninfo` / `paninfo2` only on independent substreams with
+///    `acmod < 0x2` (mono or 1+1 dual-mono source) when the
+///    respective exists-flag is set (`paninfo2` additionally
+///    requires `acmod == 0`).
 ///
 /// Codewords whose guards fail read back as `0xFF` inside
 /// [`AnnexDMixLevels`] so callers can distinguish "spec-absent" from a
@@ -683,12 +854,15 @@ struct MixingMetadata {
     pgmscl: Option<ProgramScaleFactor>,
     pgmscl2: Option<ProgramScaleFactor>,
     extpgmscl: Option<ProgramScaleFactor>,
+    paninfo: Option<PanInfo>,
+    paninfo2: Option<PanInfo>,
 }
 
 impl MixingMetadata {
     /// The `mixmdate == 0` state — every surfaced field absent (the
     /// program scale factors default to "0 dB, no scaling" per
-    /// §E.2.3.1.12/.14/.16, represented as `None`).
+    /// §E.2.3.1.12/.14/.16, and the pan position words default to
+    /// "center" per §E.2.3.1.53/.56, all represented as `None`).
     const ABSENT: Self = Self {
         annex_e_mix_levels: None,
         dmixmod: 0xFF,
@@ -697,6 +871,8 @@ impl MixingMetadata {
         pgmscl: None,
         pgmscl2: None,
         extpgmscl: None,
+        paninfo: None,
+        paninfo2: None,
     };
 }
 
@@ -757,6 +933,8 @@ fn parse_mixing_metadata(
     let mut pgmscl = None;
     let mut pgmscl2 = None;
     let mut extpgmscl = None;
+    let mut paninfo = None;
+    let mut paninfo2 = None;
     if matches!(strmtyp, StreamType::Independent) {
         // §E.2.3.1.12-13 — program scale factor for this substream's
         // own program. Absent ⇒ 0 dB (no scaling).
@@ -823,19 +1001,25 @@ fn parse_mixing_metadata(
                 // by construction; nothing more to do.
             }
         }
-        // paninfoe / paninfo + paninfo2e / paninfo2 — only when acmod < 2
-        // (mono or 1+1 dual-mono).
+        // §E.2.3.1.53-58 — paninfoe / panmean / paninfo (+ the #2
+        // copies in 1+1 dual mono) — only when acmod < 2 (a §E.3.10.8
+        // mixer pans a *mono* associated program across the main
+        // service's channels). Note the Table E1.2 row prints the
+        // 6-bit reserved field as "paninfoe"; the §E.2.3.1.55 heading
+        // names it `paninfo`.
         if acmod < 0x2 {
             let paninfoe = br.read_u32(1)? != 0;
             if paninfoe {
-                let _panmean = br.read_u32(8)?;
-                let _paninfo = br.read_u32(6)?;
+                let panmean = br.read_u32(8)? as u8;
+                let reserved = br.read_u32(6)? as u8;
+                paninfo = Some(PanInfo::from_fields(panmean, reserved));
             }
             if acmod == 0 {
                 let paninfo2e = br.read_u32(1)? != 0;
                 if paninfo2e {
-                    let _panmean2 = br.read_u32(8)?;
-                    let _paninfo2 = br.read_u32(6)?;
+                    let panmean2 = br.read_u32(8)? as u8;
+                    let reserved2 = br.read_u32(6)? as u8;
+                    paninfo2 = Some(PanInfo::from_fields(panmean2, reserved2));
                 }
             }
         }
@@ -867,6 +1051,8 @@ fn parse_mixing_metadata(
         pgmscl,
         pgmscl2,
         extpgmscl,
+        paninfo,
+        paninfo2,
     })
 }
 
@@ -2526,6 +2712,279 @@ mod tests {
         assert!(bsi.pgmscl.is_none());
         assert!(bsi.pgmscl2.is_none());
         assert!(bsi.extpgmscl.is_none());
+        assert_eq!(bsi.bits_consumed, total_bits);
+    }
+
+    /// Round 281 — §E.2.3.1.54 index scale: 1.5-degree clockwise
+    /// steps from the center speaker location, indices `0..=239`
+    /// spanning `0..=358.5` degrees, `240..=255` reserved.
+    #[test]
+    fn pan_info_degrees_mapping() {
+        assert_eq!(PanInfo::from_fields(0, 0).degrees(), Some(0.0));
+        assert_eq!(PanInfo::from_fields(1, 0).degrees(), Some(1.5));
+        assert_eq!(PanInfo::from_fields(239, 0).degrees(), Some(358.5));
+        for idx in 240..=255u16 {
+            let pi = PanInfo::from_fields(idx as u8, 0);
+            assert!(pi.is_reserved_index(), "index {idx}");
+            assert_eq!(pi.degrees(), None, "index {idx}");
+            assert_eq!(pi.stereo_scale_factors(), None, "index {idx}");
+            assert_eq!(pi.surround_scale_factors(), None, "index {idx}");
+        }
+        assert!(!PanInfo::from_fields(239, 0).is_reserved_index());
+        // §E.2.3.1.53 default: center, index 0.
+        assert_eq!(PanInfo::CENTER.panmean(), 0);
+        assert_eq!(PanInfo::CENTER.degrees(), Some(0.0));
+        // The 6-bit reserved trailer is masked + preserved verbatim.
+        assert_eq!(PanInfo::from_fields(10, 0xFF).reserved(), 0x3F);
+        assert_eq!(PanInfo::from_fields(10, 0x2A).reserved(), 0x2A);
+    }
+
+    /// Table E3.15 — stereo-output panning scale factors `(AL, AR)`
+    /// at the range boundaries: center (index 0) is the equal-power
+    /// `cos/sin(π/4)` split, the `20..=99` range is fully right, the
+    /// `140..=219` range fully left, and the trig ranges are
+    /// continuous with their flat neighbours.
+    #[test]
+    fn pan_info_stereo_scale_factors_table_e3_15() {
+        let eps = 1e-6f32;
+        // Index 0 (center): AL = cos(π/2 · 20/40) = cos(π/4) = AR.
+        let (al, ar) = PanInfo::from_fields(0, 0).stereo_scale_factors().unwrap();
+        assert!((al - std::f32::consts::FRAC_1_SQRT_2).abs() < eps);
+        assert!((ar - std::f32::consts::FRAC_1_SQRT_2).abs() < eps);
+        // Flat ranges: 20..=99 fully right, 140..=219 fully left.
+        for idx in [20u8, 60, 99] {
+            assert_eq!(
+                PanInfo::from_fields(idx, 0).stereo_scale_factors(),
+                Some((0.0, 1.0)),
+                "index {idx}"
+            );
+        }
+        for idx in [140u8, 180, 219] {
+            assert_eq!(
+                PanInfo::from_fields(idx, 0).stereo_scale_factors(),
+                Some((1.0, 0.0)),
+                "index {idx}"
+            );
+        }
+        // Range starts are continuous with the preceding flat range:
+        // index 100 → (sin 0, cos 0) = (0, 1); index 220 → (cos 0,
+        // sin 0) = (1, 0).
+        let (al, ar) = PanInfo::from_fields(100, 0).stereo_scale_factors().unwrap();
+        assert!((al - 0.0).abs() < eps && (ar - 1.0).abs() < eps);
+        let (al, ar) = PanInfo::from_fields(220, 0).stereo_scale_factors().unwrap();
+        assert!((al - 1.0).abs() < eps && (ar - 0.0).abs() < eps);
+    }
+
+    /// Table E3.15 is power-preserving over every non-reserved index:
+    /// `AL² + AR² == 1` (each range is a single sin/cos pair or a
+    /// degenerate 0/1 split).
+    #[test]
+    fn pan_info_stereo_scale_factors_power_preserving() {
+        for idx in 0..=239u8 {
+            let (al, ar) = PanInfo::from_fields(idx, 0).stereo_scale_factors().unwrap();
+            let power = al * al + ar * ar;
+            assert!((power - 1.0).abs() < 1e-5, "index {idx}: power {power}");
+            assert!((0.0..=1.0).contains(&al), "index {idx}: AL {al}");
+            assert!((0.0..=1.0).contains(&ar), "index {idx}: AR {ar}");
+        }
+    }
+
+    /// Tables E3.16 + E3.17 — 5.1-output panning at the five range
+    /// starts, each landing the source fully on a single speaker:
+    /// index 0 → Center, 20 → Right, 73 → Right Surround, 167 → Left
+    /// Surround, 220 → Left (order `[AL, AC, AR, ALS, ARS]`).
+    #[test]
+    fn pan_info_surround_scale_factors_cardinal_points() {
+        let eps = 1e-6f32;
+        for (idx, expect) in [
+            (0u8, [0.0f32, 1.0, 0.0, 0.0, 0.0]),
+            (20, [0.0, 0.0, 1.0, 0.0, 0.0]),
+            (73, [0.0, 0.0, 0.0, 0.0, 1.0]),
+            (167, [0.0, 0.0, 0.0, 1.0, 0.0]),
+            (220, [1.0, 0.0, 0.0, 0.0, 0.0]),
+        ] {
+            let got = PanInfo::from_fields(idx, 0)
+                .surround_scale_factors()
+                .unwrap();
+            for (ch, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+                assert!((g - e).abs() < eps, "index {idx} ch {ch}: {g} vs {e}");
+            }
+        }
+        // Mid-range check: index 10 splits Center/Right at
+        // cos/sin(π/4) per the Table E3.16 first row.
+        let got = PanInfo::from_fields(10, 0)
+            .surround_scale_factors()
+            .unwrap();
+        assert!((got[1] - std::f32::consts::FRAC_1_SQRT_2).abs() < eps);
+        assert!((got[2] - std::f32::consts::FRAC_1_SQRT_2).abs() < eps);
+        assert_eq!((got[0], got[3], got[4]), (0.0, 0.0, 0.0));
+    }
+
+    /// Tables E3.16 + E3.17 are jointly power-preserving over every
+    /// non-reserved index — each range pans between exactly two
+    /// adjacent speakers with a sin/cos pair, so the five squared
+    /// factors sum to 1.
+    #[test]
+    fn pan_info_surround_scale_factors_power_preserving() {
+        for idx in 0..=239u8 {
+            let sf = PanInfo::from_fields(idx, 0)
+                .surround_scale_factors()
+                .unwrap();
+            let power: f32 = sf.iter().map(|s| s * s).sum();
+            assert!((power - 1.0).abs() < 1e-5, "index {idx}: power {power}");
+            assert!(
+                sf.iter().all(|s| (0.0..=1.0).contains(s)),
+                "index {idx}: {sf:?}"
+            );
+        }
+    }
+
+    /// Round 281 — an independent mono (`acmod == 1`) syncframe with
+    /// `mixmdate == 1` and `paninfoe == 1` surfaces the typed
+    /// [`PanInfo`] (index 10 → 15°, reserved trailer preserved);
+    /// `paninfo2` stays `None` outside 1+1 dual mono.
+    #[test]
+    fn parse_surfaces_paninfo_on_mono_annex_e() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = independent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod = 3 → 6 blocks
+            (3, 1),    // acmod = 1 (1/0 mono — pan chain present)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 1),    // mixmdate = 1
+            // mixmdata body (acmod = 1 indep: no dmixmod, no mix
+            // levels, no LFE code):
+            (1, 0),    // pgmscle
+            (1, 0),    // extpgmscle
+            (2, 0),    // mixdef = 0
+            (1, 1),    // paninfoe = 1 (acmod < 2)
+            (8, 10),   // panmean = 10 → 15.0 degrees
+            (6, 0x2A), // paninfo (reserved trailer)
+            (1, 0),    // frmmixcfginfoe
+            (1, 0),    // infomdate
+            (1, 0),    // addbsie
+        ];
+        let (buf, total_bits) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        let pan = bsi.paninfo.expect("paninfoe == 1 surfaces paninfo");
+        assert_eq!(pan.panmean(), 10);
+        assert_eq!(pan.reserved(), 0x2A);
+        assert_eq!(pan.degrees(), Some(15.0));
+        assert!(bsi.paninfo2.is_none(), "no paninfo2 outside 1+1 dual mono");
+        assert_eq!(bsi.bits_consumed, total_bits);
+    }
+
+    /// 1+1 dual-mono (`acmod == 0`) independent substream — the
+    /// §E.2.3.1.56-58 `paninfo2` slot is on the wire and surfaces
+    /// independently of `paninfo`; a reserved index (240) survives
+    /// the round-trip with `degrees() == None`.
+    #[test]
+    fn parse_surfaces_paninfo2_on_dual_mono_annex_e() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = independent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 0),    // acmod = 0 (1+1 dual mono)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (5, 28),   // dialnorm2 (acmod == 0)
+            (1, 0),    // compr2e
+            (1, 1),    // mixmdate = 1
+            // mixmdata body (acmod = 0 → no dmixmod / mix levels;
+            // lfeon = 0 → no lfemixlevcode):
+            (1, 0),    // pgmscle
+            (1, 0),    // pgmscl2e (acmod == 0)
+            (1, 0),    // extpgmscle
+            (2, 0),    // mixdef = 0
+            (1, 1),    // paninfoe = 1
+            (8, 170),  // panmean = 170 → fully-left flat range
+            (6, 0),    // paninfo
+            (1, 1),    // paninfo2e = 1 (acmod == 0)
+            (8, 240),  // panmean2 = 240 → reserved index
+            (6, 0x3F), // paninfo2
+            (1, 0),    // frmmixcfginfoe
+            (1, 0),    // infomdate
+            (1, 0),    // addbsie
+        ];
+        let (buf, total_bits) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        let pan = bsi.paninfo.expect("paninfoe == 1");
+        assert_eq!(pan.panmean(), 170);
+        assert_eq!(pan.stereo_scale_factors(), Some((1.0, 0.0)));
+        let pan2 = bsi.paninfo2.expect("paninfo2e == 1");
+        assert_eq!(pan2.panmean(), 240);
+        assert!(pan2.is_reserved_index());
+        assert_eq!(pan2.degrees(), None);
+        assert_eq!(pan2.reserved(), 0x3F);
+        assert_eq!(bsi.bits_consumed, total_bits);
+    }
+
+    /// The Table E1.2 guards keep the pan chain off the wire: a 2/0
+    /// stereo (`acmod == 2`) indep substream with `mixmdate == 1`
+    /// has no `paninfoe` slot at all, and a mono substream with
+    /// `paninfoe == 0` defaults to "center" — both read back as
+    /// `None` per §E.2.3.1.53.
+    #[test]
+    fn parse_leaves_paninfo_none_when_guards_fail() {
+        // acmod = 2 — pan chain skipped entirely.
+        let stereo: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = independent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 2),    // acmod = 2 (2/0 — no pan chain per Table E1.2)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 1),    // mixmdate = 1
+            (1, 0),    // pgmscle
+            (1, 0),    // extpgmscle
+            (2, 0),    // mixdef
+            (1, 0),    // frmmixcfginfoe
+            (1, 0),    // infomdate
+            (1, 0),    // addbsie
+        ];
+        let (buf, _) = pack_msb(stereo);
+        let bsi = parse(&buf).unwrap();
+        assert!(bsi.paninfo.is_none());
+        assert!(bsi.paninfo2.is_none());
+
+        // acmod = 1 with paninfoe = 0 — defaulted to center (None).
+        let mono: &[(u32, u32)] = &[
+            (2, 0),
+            (3, 0),
+            (11, 383),
+            (2, 0),
+            (2, 3),
+            (3, 1), // acmod = 1
+            (1, 0),
+            (5, 16),
+            (5, 27),
+            (1, 0), // compre
+            (1, 1), // mixmdate = 1
+            (1, 0), // pgmscle
+            (1, 0), // extpgmscle
+            (2, 0), // mixdef
+            (1, 0), // paninfoe = 0 — pan word defaults to center
+            (1, 0), // frmmixcfginfoe
+            (1, 0), // infomdate
+            (1, 0), // addbsie
+        ];
+        let (buf, total_bits) = pack_msb(mono);
+        let bsi = parse(&buf).unwrap();
+        assert!(bsi.paninfo.is_none());
+        assert!(bsi.paninfo2.is_none());
         assert_eq!(bsi.bits_consumed, total_bits);
     }
 }

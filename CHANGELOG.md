@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 §E.2.3.1.53-58 pan-information typed surface — `PanInfo`**
+  (round 281 / r281). The pan-information pair an independent mono /
+  1+1 dual-mono substream's mixing-metadata block can carry —
+  `panmean` + the 6-bit reserved `paninfo` trailer (§E.2.3.1.53-55)
+  and the dual-mono second-channel copies `panmean2` + `paninfo2`
+  (§E.2.3.1.56-58) — lift from parse-and-discard to typed
+  `Eac3Bsi::paninfo` / `Eac3Bsi::paninfo2` fields (`Option<PanInfo>`).
+  The struct implements the §E.2.3.1.54 wire scale — index `0` points
+  the panned virtual source at the center speaker location (0
+  degrees), each step is 1.5 degrees of clockwise rotation
+  (`degrees()`, indices `0..=239` spanning `0..=358.5`), indices
+  `240..=255` reserved (`is_reserved_index()`) — with
+  `from_fields(panmean, reserved)` (6-bit masking on the trailer) /
+  `panmean()` / `reserved()` round-trip and the §E.2.3.1.53/.56
+  "defaulted to center" absent state as `None` (`PanInfo::CENTER` is
+  the explicit equivalent). The §E.3.10.8 associated-audio mixer
+  tables are implemented directly: `stereo_scale_factors() ->
+  Option<(f32, f32)>` ((AL, AR) per Table E3.15) and
+  `surround_scale_factors() -> Option<[f32; 5]>` ([AL, AC, AR, ALS,
+  ARS] per Tables E3.16 + E3.17; the LFE channel is not included per
+  spec) — every non-reserved index is a power-preserving sin/cos pan
+  between two adjacent output speakers, verified by exhaustive
+  sweeps. `Some` only when `mixmdate == 1` on an independent
+  substream (Table E1.2 emits the chain under `strmtyp == 0x0` only)
+  with `acmod < 0x2` (a §E.3.10.8 mixer pans a *mono* associated
+  program across the main service's channels) AND the respective
+  exists-flag set (`paninfo2` additionally requires `acmod == 0`).
+  Pure surfaced metadata for a downstream §E.3.10 dual-decoder mixer
+  — the single-stream decode PCM path is unchanged and encoder
+  output stays byte-identical (`mixmdate == 0` still emitted). 8 new
+  `eac3::bsi` tests: degree mapping with the 16 reserved indices,
+  Table E3.15 boundary values + flat-range/trig-range continuity,
+  stereo + 5.1 power-preservation sweeps over all 240 non-reserved
+  indices, the five 5.1 cardinal points (one full speaker each) +
+  the equal-power Center/Right midpoint, mono and 1+1 dual-mono
+  parse round-trips with cursor checks (including a reserved index
+  surviving the trip), and the `acmod >= 2` / exists-flag-clear
+  guards. 293 → 301 lib tests, all green.
 - **E-AC-3 §E.2.3.1.12-17 program-scale-factor typed surface —
   `ProgramScaleFactor`** (round 278 / r278). The three 6-bit gain words
   an independent substream's mixing-metadata block can carry — `pgmscl`

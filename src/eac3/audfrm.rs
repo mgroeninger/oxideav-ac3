@@ -633,6 +633,8 @@ mod tests {
             pgmscl: None,
             pgmscl2: None,
             extpgmscl: None,
+            paninfo: None,
+            paninfo2: None,
             compr: None,
             compr_ch2: None,
             dsurexmod: None,

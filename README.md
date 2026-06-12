@@ -562,6 +562,31 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       by 8 new `eac3::bsi::tests` including both §E.3.10 worked-example
       gains (-3 dB / -10 dB) round-tripped through `parse()` with cursor
       checks. 285 → 293 lib tests, all green.
+      **Round 281** lifts the Annex E §E.2.3.1.53-58 pan-information
+      pair — `panmean`+`paninfo` (the substream's mono program) and
+      `panmean2`+`paninfo2` (the second channel of a 1+1 dual-mono
+      program) — from parse-and-discard to typed `Eac3Bsi::paninfo` /
+      `paninfo2` fields (`Option<PanInfo>`). The `PanInfo` struct
+      implements the §E.2.3.1.54 wire scale: index `0` points the
+      panned virtual source at the center speaker (0°), each step is
+      1.5° clockwise (`degrees()`, `0..=239` → `0..=358.5°`),
+      `240..=255` reserved (`is_reserved_index()`), with the 6-bit
+      reserved trailer preserved verbatim for re-emit. The §E.3.10.8
+      mixer tables are implemented directly: `stereo_scale_factors()
+      -> Option<(AL, AR)>` (Table E3.15) and `surround_scale_factors()
+      -> Option<[AL, AC, AR, ALS, ARS]>` (Tables E3.16-E3.17, LFE
+      excluded per spec) — both power-preserving sin/cos pans between
+      adjacent speakers, verified over every non-reserved index.
+      `Some` only when `mixmdate == 1` on an independent substream
+      with `acmod < 0x2` (a §E.3.10.8 mixer pans a *mono* associated
+      program) and the exists-flag set; `None` defaults the pan word
+      to "center" per §E.2.3.1.53/.56 (`PanInfo::CENTER`). Decode PCM
+      path unchanged; encoder output byte-identical. Covered by 8 new
+      `eac3::bsi::tests` (degree mapping + reserved indices, Table
+      E3.15 boundaries + continuity, both power-preservation sweeps,
+      5.1 cardinal points, mono + dual-mono parse round-trips with
+      cursor checks, and the acmod≥2 / exists-flag-clear guards).
+      293 → 301 lib tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

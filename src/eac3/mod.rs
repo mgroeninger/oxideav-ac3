@@ -72,6 +72,6 @@ pub mod tables;
 // file `eac3.rs` so external callers (the encoder integration test in
 // `tests/eac3_ffmpeg.rs` and the workspace registration in
 // `crate::lib::register`) don't need to change.
-pub use bsi::{Bsi as Eac3Bsi, ProgramScaleFactor, BSID_BASE_AC3_MAX, EAC3_BSID};
+pub use bsi::{Bsi as Eac3Bsi, PanInfo, ProgramScaleFactor, BSID_BASE_AC3_MAX, EAC3_BSID};
 pub use decoder::{decode_eac3_packet, Eac3DecoderState};
 pub use encoder::{make_encoder, CODEC_ID_STR};
