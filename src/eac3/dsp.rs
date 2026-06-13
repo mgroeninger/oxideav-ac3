@@ -2097,6 +2097,7 @@ mod aht_regs_tests {
             extpgmscl: None,
             paninfo: None,
             paninfo2: None,
+            premix_compression: None,
             compr: None,
             compr_ch2: None,
             dsurexmod: None,

@@ -587,6 +587,35 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       5.1 cardinal points, mono + dual-mono parse round-trips with
       cursor checks, and the acmod≥2 / exists-flag-clear guards).
       293 → 301 lib tests, all green.
+      **Round 288** lifts the Annex E §E.2.3.1.19-21 premix-compression
+      trio — `premixcmpsel` (compression-word select), `drcsrc`
+      (DRC-word source), `premixcmpscl` (compression-word scale
+      factor) — carried in the `mixdef == 0x1` ("mixing option 2")
+      body of an independent substream's mixing-metadata block, from
+      parse-and-discard to a typed `Eac3Bsi::premix_compression` field
+      (`Option<PremixCompression>`). The struct exposes raw
+      `premixcmpsel()` / `drcsrc()` / `premixcmpscl()` round-trip,
+      typed `compression_word() -> PremixCompressionWord` (`DynRng` /
+      `Compr`, §E.2.3.1.19), `drc_source() -> DrcSource`
+      (`ExternalProgram` / `CurrentSubstream`, §E.2.3.1.20), a Table
+      E2.7 `scale_ratio() -> Option<f32>` (seven listed codes → `n/6`
+      gain-reduction ratios `0/6..=6/6`; the unlisted `0b110`
+      codepoint is `is_premixcmpscl_reserved()` → `None`), and an
+      `is_recommended_default()` predicate (§E.2.3.1.21 recommended
+      `0 / 0 / 000`). `Some` only when `mixmdate == 1`, the substream
+      is independent, AND the block selects `mixdef == 0x1`; a
+      `mixdef ∈ {0, 2, 3}` block does not carry the three fields as a
+      standalone 5-bit group so they stay `None` there (the same
+      §E.2.3.1.19-21 fields inside the `mixdef == 0x3` `mixdata` body
+      remain an opaque skip). The single-stream decode PCM path is
+      unchanged and encoder output stays byte-identical — pure
+      surfaced metadata for a downstream §E.3.10 mixer. Covered by 4
+      new `eac3::bsi::tests` (the full Table E2.7 ratio sweep + the
+      reserved `0b110` codepoint + percentage-caption cross-check; the
+      typed-view + recommended-default + 3-bit-masking checks; a
+      `mixdef == 0x1` parse round-trip with a cursor check; and the
+      `mixdef ∈ {0}` / `mixmdate == 0` None guards). 301 → 305 lib
+      tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

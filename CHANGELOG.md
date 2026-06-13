@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 §E.2.3.1.19-21 premix-compression typed surface —
+  `PremixCompression`** (round 288 / r288). The three fields the
+  `mixdef == 0x1` ("mixing option 2") body of an independent
+  substream's mixing-metadata block carries to steer a §E.3.10
+  dual-decoder mixer's premix compression process —
+  `premixcmpsel` (compression-word select, 1 bit), `drcsrc`
+  (DRC-word source, 1 bit), and `premixcmpscl` (compression-word
+  scale factor, 3 bits) — lift from parse-and-discard to a typed
+  `Eac3Bsi::premix_compression` field (`Option<PremixCompression>`).
+  The struct exposes `from_fields()` / `premixcmpsel()` / `drcsrc()`
+  / `premixcmpscl()` round-trip, typed `compression_word() ->
+  PremixCompressionWord` (`DynRng` / `Compr`, §E.2.3.1.19) and
+  `drc_source() -> DrcSource` (`ExternalProgram` / `CurrentSubstream`,
+  §E.2.3.1.20) views, `scale_ratio() -> Option<f32>` implementing
+  Table E2.7 (the seven listed codes map to `n/6` gain-reduction
+  ratios `0/6..=6/6`; the unlisted `0b110` codepoint is
+  `is_premixcmpscl_reserved()` → `None`), and an
+  `is_recommended_default()` predicate for the §E.2.3.1.21
+  recommended `premixcmpsel=0 / drcsrc=0 / premixcmpscl=000`
+  configuration. `Some` only when `mixmdate == 1`, the substream is
+  independent, and the block selects `mixdef == 0x1`; `None`
+  otherwise (a `mixdef ∈ {0, 2, 3}` block does not carry the three
+  fields as a standalone 5-bit group). The single-stream decode PCM
+  path is unchanged and encoder output stays byte-identical — this
+  is pure surfaced metadata for a downstream §E.3.10 mixer. Covered
+  by 4 new `eac3::bsi::tests` (the full Table E2.7 ratio sweep + the
+  reserved `0b110` codepoint + percentage-caption cross-check, the
+  typed-view + recommended-default + 3-bit masking checks, a
+  `mixdef == 0x1` parse round-trip with a cursor check, and the
+  `mixdef ∈ {0}` / `mixmdate == 0` None guards). 301 → 305 lib
+  tests, all green.
+
 - **E-AC-3 §E.2.3.1.53-58 pan-information typed surface — `PanInfo`**
   (round 281 / r281). The pan-information pair an independent mono /
   1+1 dual-mono substream's mixing-metadata block can carry —

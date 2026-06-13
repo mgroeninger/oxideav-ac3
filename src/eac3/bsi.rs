@@ -315,6 +315,152 @@ impl PanInfo {
     }
 }
 
+/// §E.2.3.1.19-21 premix-compression control — the three fields the
+/// `mixdef == 0x1` ("mixing option 2") body of an independent
+/// substream's mixing-metadata block carries to steer a §E.3.10
+/// dual-decoder mixer's *premix compression* process (the dynamic-
+/// range / gain adjustment applied to the main audio service before
+/// the associated program is mixed in):
+///
+/// * `premixcmpsel` (§E.2.3.1.19, 1 bit) — *premix compression word
+///   select*. `false` ⇒ the `dynrng` field is used in the premix
+///   compression process; `true` ⇒ the `compr` field is used.
+/// * `drcsrc` (§E.2.3.1.20, 1 bit) — *dynamic-range-control word
+///   source*. `false` ⇒ the `dynrng` / `compr` fields of the
+///   **external** program (the one in a separate bit stream /
+///   independent substream) control the mix; `true` ⇒ the fields of
+///   the **current** substream are used. Recommended `false`.
+/// * `premixcmpscl` (§E.2.3.1.21, 3 bits) — *premix compression word
+///   scale factor*. Table E2.7 maps the code to a compression
+///   gain-reduction ratio applied before the main-service / external
+///   mix. Recommended `0b000` (no compression).
+///
+/// Per §E.2.3.1.21 all three fields "shall be present in the
+/// bitstream. However they should be set to the recommended values,
+/// as decoders are not required to use them." The single-stream
+/// decode path is unchanged — this is pure surfaced metadata for a
+/// downstream §E.3.10 mixer. The same three fields also appear inside
+/// the `mixdef == 0x3` ("mixing option 4") `mixdata` body; this
+/// surface covers the `mixdef == 0x1` carriage only (the variable
+/// option-4 body stays an opaque skip).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PremixCompression {
+    premixcmpsel: bool,
+    drcsrc: bool,
+    premixcmpscl: u8,
+}
+
+/// The compression word a §E.3.10 premix process draws on, selected
+/// by `premixcmpsel` (§E.2.3.1.19).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PremixCompressionWord {
+    /// `premixcmpsel == 0` — the §5.4.3.x `dynrng` dynamic-range word.
+    DynRng,
+    /// `premixcmpsel == 1` — the §5.4.2.10 `compr` heavy-compression
+    /// word.
+    Compr,
+}
+
+/// Which program's dynamic-range-control words drive the mix, selected
+/// by `drcsrc` (§E.2.3.1.20).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrcSource {
+    /// `drcsrc == 0` — the **external** program's `dynrng` / `compr`
+    /// fields (the recommended setting).
+    ExternalProgram,
+    /// `drcsrc == 1` — the **current** substream's `dynrng` / `compr`
+    /// fields.
+    CurrentSubstream,
+}
+
+impl PremixCompression {
+    /// Wraps the raw `mixdef == 0x1` body: `premixcmpsel` (1 bit),
+    /// `drcsrc` (1 bit), and the 3-bit `premixcmpscl` code (upper bits
+    /// masked so a caller can pass a wider word verbatim).
+    pub fn from_fields(premixcmpsel: bool, drcsrc: bool, premixcmpscl: u8) -> Self {
+        Self {
+            premixcmpsel,
+            drcsrc,
+            premixcmpscl: premixcmpscl & 0x7,
+        }
+    }
+
+    /// Raw `premixcmpsel` bit (§E.2.3.1.19) for bit-stream round-trip.
+    pub fn premixcmpsel(self) -> bool {
+        self.premixcmpsel
+    }
+
+    /// Raw `drcsrc` bit (§E.2.3.1.20) for bit-stream round-trip.
+    pub fn drcsrc(self) -> bool {
+        self.drcsrc
+    }
+
+    /// Raw 3-bit `premixcmpscl` code (§E.2.3.1.21) for bit-stream
+    /// round-trip.
+    pub fn premixcmpscl(self) -> u8 {
+        self.premixcmpscl
+    }
+
+    /// Typed view of `premixcmpsel` — which compression word the
+    /// premix process uses (§E.2.3.1.19).
+    pub fn compression_word(self) -> PremixCompressionWord {
+        if self.premixcmpsel {
+            PremixCompressionWord::Compr
+        } else {
+            PremixCompressionWord::DynRng
+        }
+    }
+
+    /// Typed view of `drcsrc` — which program's DRC words drive the
+    /// mix (§E.2.3.1.20).
+    pub fn drc_source(self) -> DrcSource {
+        if self.drcsrc {
+            DrcSource::CurrentSubstream
+        } else {
+            DrcSource::ExternalProgram
+        }
+    }
+
+    /// `true` for the `0b110` `premixcmpscl` codepoint, which has no
+    /// row in Table E2.7 (the table lists `000,001,010,011,100,101,111`
+    /// only). Reserved / undefined; [`Self::scale_ratio`] returns
+    /// `None` for it.
+    pub fn is_premixcmpscl_reserved(self) -> bool {
+        self.premixcmpscl == 0b110
+    }
+
+    /// Table E2.7 compression gain-reduction ratio for `premixcmpscl`:
+    /// the seven listed codes map to `code / 6` (`0b000` ⇒ 0% / no
+    /// compression, ascending in `1/6` steps to `0b111` ⇒ 100% /
+    /// maximum compression). `None` for the unlisted `0b110`
+    /// codepoint. The spec captions the column "Scale Factor" with
+    /// percentage values (16.7%, 33.3%, …) that are exactly the
+    /// `n/6` ratios rounded to one decimal.
+    pub fn scale_ratio(self) -> Option<f32> {
+        let sixth = match self.premixcmpscl {
+            0b000 => 0,
+            0b001 => 1,
+            0b010 => 2,
+            0b011 => 3,
+            0b100 => 4,
+            0b101 => 5,
+            0b111 => 6,
+            _ => return None, // 0b110: not in Table E2.7
+        };
+        Some(sixth as f32 / 6.0)
+    }
+
+    /// `true` for the recommended default configuration
+    /// (§E.2.3.1.19-21): `premixcmpsel == 0`, `drcsrc == 0`,
+    /// `premixcmpscl == 0b000` (no compression). An encoder writing a
+    /// `mixdef == 0x1` block "should" set this; a decoder seeing a
+    /// non-default configuration is the signal that the encoder
+    /// actually intends premix compression to take effect.
+    pub fn is_recommended_default(self) -> bool {
+        !self.premixcmpsel && !self.drcsrc && self.premixcmpscl == 0
+    }
+}
+
 /// Parsed E-AC-3 BSI — the subset actually needed by the round-1
 /// decoder + dispatcher. Fields not surfaced are still parsed (the
 /// bit cursor walk has to land at the start of `audfrm()`).
@@ -454,6 +600,18 @@ pub struct Bsi {
     /// (1+1 dual mono). `Some` only when `mixmdate == 1`, the
     /// substream is independent, `acmod == 0`, AND `paninfo2e == 1`.
     pub paninfo2: Option<PanInfo>,
+    /// §E.2.3.1.19-21 premix-compression control (`premixcmpsel` /
+    /// `drcsrc` / `premixcmpscl`) — the three fields that steer a
+    /// §E.3.10 mixer's premix compression process. `Some` only when
+    /// `mixmdate == 1`, the substream is independent, AND the
+    /// mixing-metadata block selects `mixdef == 0x1` ("mixing option
+    /// 2"); `None` otherwise (a `mixdef ∈ {0, 2, 3}` block does not
+    /// carry the three fields as a standalone 5-bit group, and a
+    /// `mixmdate == 0` syncframe skips the whole block). See
+    /// [`PremixCompression`] for the field semantics + Table E2.7
+    /// scale lookup. The single-stream decode path does not consult
+    /// it.
+    pub premix_compression: Option<PremixCompression>,
     /// Heavy compression gain word (`compr`, §E.2.3.1.x / §5.4.2.10 +
     /// §7.7.2.2 reused per Annex E). Identical semantics + wire format
     /// to base AC-3 — see [`CompressionGain`] for the X/Y decode. For
@@ -728,6 +886,7 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         extpgmscl,
         paninfo,
         paninfo2,
+        premix_compression,
     } = if mixmdate {
         parse_mixing_metadata(br, acmod, lfeon, strmtyp, numblkscod)?
     } else {
@@ -808,6 +967,7 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         extpgmscl,
         paninfo,
         paninfo2,
+        premix_compression,
         compr,
         compr_ch2,
         dsurexmod,
@@ -856,6 +1016,7 @@ struct MixingMetadata {
     extpgmscl: Option<ProgramScaleFactor>,
     paninfo: Option<PanInfo>,
     paninfo2: Option<PanInfo>,
+    premix_compression: Option<PremixCompression>,
 }
 
 impl MixingMetadata {
@@ -873,6 +1034,7 @@ impl MixingMetadata {
         extpgmscl: None,
         paninfo: None,
         paninfo2: None,
+        premix_compression: None,
     };
 }
 
@@ -935,6 +1097,7 @@ fn parse_mixing_metadata(
     let mut extpgmscl = None;
     let mut paninfo = None;
     let mut paninfo2 = None;
+    let mut premix_compression = None;
     if matches!(strmtyp, StreamType::Independent) {
         // §E.2.3.1.12-13 — program scale factor for this substream's
         // own program. Absent ⇒ 0 dB (no scaling).
@@ -961,8 +1124,16 @@ fn parse_mixing_metadata(
         match mixdef {
             0 => { /* no additional bits */ }
             1 => {
-                // premixcmpsel(1) + drcsrc(1) + premixcmpscl(3) = 5
-                let _ = br.read_u32(5)?;
+                // §E.2.3.1.19-21 — premixcmpsel(1) + drcsrc(1) +
+                // premixcmpscl(3) = 5 bits ("mixing option 2").
+                let premixcmpsel = br.read_u32(1)? != 0;
+                let drcsrc = br.read_u32(1)? != 0;
+                let premixcmpscl = br.read_u32(3)? as u8;
+                premix_compression = Some(PremixCompression::from_fields(
+                    premixcmpsel,
+                    drcsrc,
+                    premixcmpscl,
+                ));
             }
             2 => {
                 // mixdata = 12 bits (Table E1.2 — "mixing option 3, 12 bits reserved").
@@ -1053,6 +1224,7 @@ fn parse_mixing_metadata(
         extpgmscl,
         paninfo,
         paninfo2,
+        premix_compression,
     })
 }
 
@@ -2986,5 +3158,176 @@ mod tests {
         assert!(bsi.paninfo.is_none());
         assert!(bsi.paninfo2.is_none());
         assert_eq!(bsi.bits_consumed, total_bits);
+    }
+
+    // ---- §E.2.3.1.19-21 premix-compression (PremixCompression) ----
+
+    /// Table E2.7 — every listed `premixcmpscl` code maps to its
+    /// `n/6` compression gain-reduction ratio, the unlisted `0b110`
+    /// codepoint surfaces as reserved (`scale_ratio() == None`), and
+    /// the percentage captions in the spec round to the `n/6` values.
+    #[test]
+    fn premixcmpscl_scale_ratio_table_e2_7() {
+        // (code, expected sixths)
+        let listed: &[(u8, u8)] = &[
+            (0b000, 0),
+            (0b001, 1),
+            (0b010, 2),
+            (0b011, 3),
+            (0b100, 4),
+            (0b101, 5),
+            (0b111, 6),
+        ];
+        for &(code, sixths) in listed {
+            let pc = PremixCompression::from_fields(false, false, code);
+            assert!(!pc.is_premixcmpscl_reserved(), "code {code:#05b} is listed");
+            let ratio = pc.scale_ratio().expect("listed code has a ratio");
+            assert!(
+                (ratio - sixths as f32 / 6.0).abs() < 1e-6,
+                "code {code:#05b} → {ratio}, want {}/6",
+                sixths
+            );
+        }
+        // 0b110: no Table E2.7 row.
+        let reserved = PremixCompression::from_fields(false, false, 0b110);
+        assert!(reserved.is_premixcmpscl_reserved());
+        assert!(reserved.scale_ratio().is_none());
+        // Spec percentage captions match the n/6 ratios.
+        let pct = |code: u8| PremixCompression::from_fields(false, false, code).scale_ratio();
+        assert!((pct(0b001).unwrap() - 0.167).abs() < 0.001); // 16.7%
+        assert!((pct(0b010).unwrap() - 0.333).abs() < 0.001); // 33.3%
+        assert!((pct(0b011).unwrap() - 0.5).abs() < 1e-6); //    50%
+        assert!((pct(0b100).unwrap() - 0.667).abs() < 0.001); // 66.7%
+        assert!((pct(0b101).unwrap() - 0.833).abs() < 0.001); // 83.3%
+    }
+
+    /// `premixcmpsel` / `drcsrc` typed views (§E.2.3.1.19-20) and the
+    /// recommended-default predicate (§E.2.3.1.21 note).
+    #[test]
+    fn premix_compression_typed_views_and_default() {
+        let default = PremixCompression::from_fields(false, false, 0b000);
+        assert_eq!(default.compression_word(), PremixCompressionWord::DynRng);
+        assert_eq!(default.drc_source(), DrcSource::ExternalProgram);
+        assert!(default.is_recommended_default());
+
+        let custom = PremixCompression::from_fields(true, true, 0b011);
+        assert_eq!(custom.compression_word(), PremixCompressionWord::Compr);
+        assert_eq!(custom.drc_source(), DrcSource::CurrentSubstream);
+        assert!(!custom.is_recommended_default());
+        // Raw round-trip.
+        assert!(custom.premixcmpsel());
+        assert!(custom.drcsrc());
+        assert_eq!(custom.premixcmpscl(), 0b011);
+        // Each non-default field alone breaks the recommended default.
+        assert!(!PremixCompression::from_fields(true, false, 0).is_recommended_default());
+        assert!(!PremixCompression::from_fields(false, true, 0).is_recommended_default());
+        assert!(!PremixCompression::from_fields(false, false, 1).is_recommended_default());
+        // Upper bits of premixcmpscl are masked to 3 bits.
+        assert_eq!(
+            PremixCompression::from_fields(false, false, 0b1111).premixcmpscl(),
+            0b111
+        );
+    }
+
+    /// `mixdef == 0x1` body on an independent 3/2 substream surfaces
+    /// the typed `premix_compression` field; the parse cursor lands
+    /// exactly at `audfrm()` (`bits_consumed == total`).
+    #[test]
+    fn parse_surfaces_premix_compression_mixdef1_annex_e() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = independent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod = 3 → 6 blocks
+            (3, 7),    // acmod = 7 (3/2)
+            (1, 1),    // lfeon = 1
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 1),    // mixmdate = 1
+            // mixmdata body (acmod = 7, lfeon = 1, independent):
+            (2, 0), // dmixmod
+            (3, 0), // ltrtcmixlev
+            (3, 0), // lorocmixlev
+            (3, 0), // ltrtsurmixlev
+            (3, 0), // lorosurmixlev
+            (1, 0), // lfemixlevcode = 0
+            (1, 0), // pgmscle = 0
+            (1, 0), // extpgmscle = 0
+            (2, 1), // mixdef = 1 ("mixing option 2")
+            // §E.2.3.1.19-21 body:
+            (1, 1), // premixcmpsel = 1 → use compr
+            (1, 0), // drcsrc = 0 → external program (recommended)
+            (3, 4), // premixcmpscl = 0b100 → 66.7%
+            (1, 0), // frmmixcfginfoe
+            (1, 0), // infomdate
+            (1, 0), // addbsie
+        ];
+        let (buf, total_bits) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        let pc = bsi
+            .premix_compression
+            .expect("mixdef == 0x1 surfaces premix_compression");
+        assert!(pc.premixcmpsel());
+        assert!(!pc.drcsrc());
+        assert_eq!(pc.premixcmpscl(), 0b100);
+        assert_eq!(pc.compression_word(), PremixCompressionWord::Compr);
+        assert_eq!(pc.drc_source(), DrcSource::ExternalProgram);
+        assert!((pc.scale_ratio().unwrap() - 4.0 / 6.0).abs() < 1e-6);
+        assert!(!pc.is_recommended_default());
+        assert_eq!(bsi.bits_consumed, total_bits);
+    }
+
+    /// A `mixdef ∈ {0, 2}` block leaves `premix_compression` `None`
+    /// (the three fields are not carried as a standalone group), and a
+    /// `mixmdate == 0` syncframe also reports `None`.
+    #[test]
+    fn parse_leaves_premix_compression_none_for_other_mixdef() {
+        // mixdef = 0 on a 2/0 independent substream.
+        let mixdef0: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = independent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 2),    // acmod = 2 (2/0)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 1),    // mixmdate = 1
+            (1, 0),    // pgmscle
+            (1, 0),    // extpgmscle
+            (2, 0),    // mixdef = 0 → no premix body
+            (1, 0),    // frmmixcfginfoe
+            (1, 0),    // infomdate
+            (1, 0),    // addbsie
+        ];
+        let (buf, total_bits) = pack_msb(mixdef0);
+        let bsi = parse(&buf).unwrap();
+        assert!(bsi.premix_compression.is_none());
+        assert_eq!(bsi.bits_consumed, total_bits);
+
+        // mixmdate = 0 → whole mixing-metadata block skipped.
+        let no_mix: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = independent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 2),    // acmod = 2
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // mixmdate = 0
+            (1, 0),    // infomdate
+            (1, 0),    // addbsie
+        ];
+        let (buf2, total2) = pack_msb(no_mix);
+        let bsi2 = parse(&buf2).unwrap();
+        assert!(bsi2.premix_compression.is_none());
+        assert_eq!(bsi2.bits_consumed, total2);
     }
 }
