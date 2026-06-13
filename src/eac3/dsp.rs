@@ -576,10 +576,17 @@ pub fn decode_indep_audblks(
                 // §E.1.3.3.6 ecplinu — enhanced coupling flag.
                 let ecplinu = br.read_u32(1)? != 0;
                 if ecplinu {
+                    // Enhanced-coupling *synthesis* (§E.3.5.5 amplitude /
+                    // angle / chaos reconstruction) is not implemented, so
+                    // we still reject here rather than emit wrong PCM. The
+                    // band *geometry* (§E.2.3.3.16-19) is now spec-derived
+                    // and unit-tested in [`super::ecpl`], ready for the
+                    // synthesis step to consume.
                     return Err(Error::unsupported(
                         "eac3 audblk: ecplinu == 1 (enhanced coupling) — \
-                         round 5 standard coupling only; \
-                         enhanced coupling per §E.1.3.3.7-26 deferred",
+                         band geometry per §E.2.3.3.16-19 derivable \
+                         (see eac3::ecpl), but §E.3.5.5 synthesis \
+                         (amplitude/angle/chaos) deferred",
                     ));
                 }
                 // §E.1.3.3.7 chincpl[ch] — implicit 1 for both channels

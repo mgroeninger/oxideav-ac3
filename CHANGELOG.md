@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 enhanced-coupling band geometry — `eac3::ecpl`** (round
+  293 / r293). A new pure, spec-tabulated geometry module for the
+  `ecplinu == 1` (enhanced coupling) decode path, covering
+  ATSC A/52:2018 Annex E §E.2.3.3.16-19 + §E.3.5.2: `begin_subbnd()`
+  / `end_subbnd()` (Table E3.8 derivations of `ecpl_begin_subbnd`
+  from `ecplbegf` and `ecpl_end_subbnd` from `ecplendf`, or from the
+  SPX begin when spectral extension is co-active), `ECPL_SUBBND_TAB`
+  (Table E3.9 `ecplsubbndtab[]` — the 22 sub-band start
+  transform-coefficient numbers + a one-past-the-end sentinel),
+  `DEFAULT_ECPL_BNDSTRC` (Table E2.14 `defecplbndstrc[]` default
+  banding), `necplbnd()` (§E.2.3.3.19 band count from the
+  per-sub-band merge bits), and `band_bin_counts()` (§E.3.5.5.1
+  `nbins_per_bnd_array[]` population). This is the geometry
+  foundation the still-deferred §E.3.5.5 synthesis (amplitude /
+  angle / chaos parameter decode + complex coordinate
+  reconstruction) will consume; the decoder still rejects
+  `ecplinu == 1` at the synthesis stage rather than emit incorrect
+  PCM, but the rejection diagnostic now points at the derivable
+  geometry. 10 new `eac3::ecpl::tests` cover every Table E3.8
+  begin/end branch (SPX off + both SPX-active sub-cases), the
+  6/12-bin sub-band widths of Table E3.9, the Table E2.14 default
+  merge rows, the `necplbnd` count under both all-zero and
+  default banding, and `band_bin_counts` totals matching the
+  Table E3.9 region span. Spec erratum noted: the default-banding
+  table is captioned "E2.14" in the document's table list but
+  cross-referenced as "E2.13" from §E.2.3.3.18 (the latter collides
+  with the standard-coupling default at the genuine Table E2.13);
+  the values used are those listed in full under the §E.2.3.3.18
+  heading.
 - **E-AC-3 §E.2.3.1.19-21 premix-compression typed surface —
   `PremixCompression`** (round 288 / r288). The three fields the
   `mixdef == 0x1` ("mixing option 2") body of an independent

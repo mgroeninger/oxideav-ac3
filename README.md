@@ -616,6 +616,36 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       `mixdef == 0x1` parse round-trip with a cursor check; and the
       `mixdef ∈ {0}` / `mixmdate == 0` None guards). 301 → 305 lib
       tests, all green.
+
+      **Round 293** lays the geometry foundation for the
+      enhanced-coupling (`ecplinu == 1`) decode path in a new pure,
+      spec-tabulated `eac3::ecpl` module covering A/52:2018 Annex E
+      §E.2.3.3.16-19 + §E.3.5.2. `begin_subbnd()` derives
+      `ecpl_begin_subbnd` from the 4-bit `ecplbegf` (Table E3.8: `<3`
+      → `·2`, `<13` → `+2`, else `·2−10`); `end_subbnd()` derives
+      `ecpl_end_subbnd` either from `ecplendf` (`+7`, SPX off) or from
+      the SPX begin when spectral extension is co-active (`spxbegf+5`
+      for `spxbegf<6`, else `spxbegf·2`) so the two high-frequency
+      regions abut. `ECPL_SUBBND_TAB` transcribes Table E3.9
+      `ecplsubbndtab[]` — the 22 sub-band start transform-coefficient
+      numbers (sub-bands 0-3 are 6 bins wide, 4-21 are 12 bins,
+      region 13..=252) plus a one-past-the-end sentinel.
+      `DEFAULT_ECPL_BNDSTRC` is Table E2.14 `defecplbndstrc[]`.
+      `necplbnd()` implements the §E.2.3.3.19 band count
+      (`end−begin` minus the set merge bits) and `band_bin_counts()`
+      the §E.3.5.5.1 `nbins_per_bnd_array[]` population. This is the
+      verified geometry the still-deferred §E.3.5.5 synthesis
+      (amplitude / angle / chaos parameter decode + complex
+      coordinate reconstruction) will consume; the decoder still
+      rejects `ecplinu == 1` at the synthesis stage rather than emit
+      incorrect PCM, but the diagnostic now points at the derivable
+      geometry in `eac3::ecpl`. Spec erratum noted: the
+      default-banding table is captioned "E2.14" in the document's
+      table list but cross-referenced as "E2.13" from §E.2.3.3.18
+      (which collides with the standard-coupling default at the
+      genuine Table E2.13); the values used are those listed in full
+      under the §E.2.3.3.18 heading. 10 new `eac3::ecpl::tests`;
+      305 → 315 lib tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)
