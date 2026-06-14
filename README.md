@@ -646,6 +646,41 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       genuine Table E2.13); the values used are those listed in full
       under the §E.2.3.3.18 heading. 10 new `eac3::ecpl::tests`;
       305 → 315 lib tests, all green.
+
+      **Round 300** lifts the second layer onto that geometry: the
+      enhanced-coupling **bitstream syntax** parse. `eac3::ecpl`
+      grows `parse_strategy()` (§E.2.3.3.16-19) and `parse_coords()`
+      (§E.2.3.3.20-26) plus the typed `EcplStrategy` /
+      `EcplCoords` / `EcplChannelParams` carriers. `parse_strategy()`
+      reads `ecplbegf` (4 b) → `ecpl_begin_subbnd`, then `ecplendf`
+      (4 b) **only when SPX is off** (under SPX the field is omitted
+      and the end is derived from `spxbegf`), then `ecplbndstrce`
+      (1 b) gating the per-sub-band merge bits over
+      `sbnd ∈ [max(9, begin+1), end)` — the sub-bands through
+      `max(8, begin)` are known-zero and never sent, so the first
+      active sub-band always opens a band. `ecplbndstrce == 0`
+      reuses the caller-supplied banding (the Table E2.14 default on
+      the first enhanced-coupling block, the previous block's
+      structure afterward) with zero bits consumed.
+      `parse_coords()` reads `ecplangleintrp` (1 b) then walks the
+      fbw channels: a channel's first enhanced-coupling block has
+      *implicit* `ecplparam1e`/`ecplparam2e` (all parameters forced
+      present per §E.2.3.3.21-22), later blocks read the explicit
+      exist bits; `ecplamp[bnd]` (5 b) follows when `param1e`,
+      `ecplangle[bnd]` (6 b) + `ecplchaos[bnd]` (3 b) when `param2e`.
+      The **first coupled channel** carries no `ecplparam2e`,
+      `ecplangle`, `ecplchaos`, or `ecpltrans` (its angle/chaos are
+      spec-fixed to 0, §E.2.3.3.24-26); `ecpltrans` (1 b) closes
+      each later channel. Both readers advance the bit cursor exactly
+      per the reference syntax — verified by bit-exact
+      `bit_position()` assertions on hand-built bitstreams — so an
+      enhanced-coupling block can now be walked without desync. The
+      §E.3.5.5 coordinate reconstruction (turning the decoded indices
+      into complex gains via Tables E3.10-E3.12) stays the deferred
+      next step; the decoder's `ecplinu == 1` reject is unchanged for
+      now (parsing is a pure tested layer, not yet wired into the
+      audblk walk). 6 new `eac3::ecpl::tests` (315 → 321 lib tests),
+      all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

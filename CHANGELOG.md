@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 enhanced-coupling bitstream-syntax parse — `eac3::ecpl`**
+  (round 300 / r300). Adds the syntax layer on top of the r293
+  geometry: `parse_strategy()` reads the §E.2.3.3.16-19 strategy
+  fields (`ecplbegf` → begin sub-band; `ecplendf` only when SPX is
+  off; `ecplbndstrce` gating per-sub-band merge bits over
+  `[max(9, begin+1), end)`; default/previous banding reuse with no
+  bits consumed when `ecplbndstrce == 0`), and `parse_coords()`
+  reads the §E.2.3.3.20-26 coordinate block (`ecplangleintrp`;
+  per-channel implicit-on-first-block / explicit-thereafter
+  `ecplparam1e`/`ecplparam2e`; `ecplamp` 5 b, `ecplangle` 6 b,
+  `ecplchaos` 3 b per band; `ecpltrans` 1 b — with the first coupled
+  channel carrying no angle/chaos/trans per the spec's fixed-zero
+  rule). Typed `EcplStrategy` / `EcplCoords` / `EcplChannelParams`
+  carriers; both readers advance the bit cursor exactly per the
+  reference syntax (verified by `bit_position()` assertions). The
+  §E.3.5.5 coordinate reconstruction (Tables E3.10-E3.12) remains
+  the deferred next step; the decoder's `ecplinu == 1` reject is
+  unchanged. 6 new `eac3::ecpl::tests` (315 → 321 lib tests).
 - **E-AC-3 enhanced-coupling band geometry — `eac3::ecpl`** (round
   293 / r293). A new pure, spec-tabulated geometry module for the
   `ecplinu == 1` (enhanced coupling) decode path, covering

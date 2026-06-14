@@ -34,6 +34,15 @@
 //! construction. Keeping the geometry isolated and unit-tested gives the
 //! synthesis step a verified foundation.
 //!
+//! As of round 300 the module also carries the **bitstream-syntax** layer
+//! that sits on top of the geometry: [`parse_strategy`] reads the
+//! §E.2.3.3.16-19 strategy fields and [`parse_coords`] reads the
+//! §E.2.3.3.20-26 per-band amplitude / angle / chaos coordinates. These
+//! advance the bit cursor exactly per the reference syntax so an
+//! enhanced-coupling block can be walked without desync — the §E.3.5.5
+//! coordinate reconstruction that turns the decoded indices into complex
+//! gains is still a separate, deferred step.
+//!
 //! **Spec note (erratum):** the default-banding table is captioned
 //! "Table E2.14" in the document's table-of-contents (and list of
 //! tables) but is cross-referenced as "Table E2.13" from the body of
@@ -41,6 +50,9 @@
 //! default at the genuine Table E2.13. The two tables hold different
 //! values; the enhanced-coupling values used here are those listed in
 //! full under the §E.2.3.3.18 heading.
+
+use oxideav_core::bits::BitReader;
+use oxideav_core::Result;
 
 /// Table E3.9 — `ecplsubbndtab[]`. The starting transform-coefficient
 /// number of each of the 22 enhanced-coupling sub-bands, with a
@@ -188,9 +200,252 @@ pub fn end_bin(end: usize) -> usize {
     ECPL_SUBBND_TAB[end.min(N_ECPL_SUBBND)]
 }
 
+/// Maximum number of enhanced-coupling bands. Equals [`N_ECPL_SUBBND`]
+/// (no merge bits → every sub-band is its own band), so a fixed-size
+/// per-band buffer never overflows.
+pub const MAX_ECPL_BND: usize = N_ECPL_SUBBND;
+
+/// The decoded **enhanced-coupling strategy** for a block (§E.2.3.3.16-19).
+///
+/// This is the resolved geometry the coordinate parse + the eventual
+/// §E.3.5.5 synthesis consume: the active sub-band span, the per-sub-band
+/// merge structure, and the derived band count. It is produced by
+/// [`parse_strategy`] from the `cplstre[blk] && cplinu[blk] && ecplinu`
+/// branch of Table E1.4, or carried forward unchanged on a block whose
+/// `cplstre[blk]` is `0` (strategy reuse).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EcplStrategy {
+    /// `ecpl_begin_subbnd` — index of the first active sub-band
+    /// (§E.2.3.3.16).
+    pub begin_subbnd: usize,
+    /// `ecpl_end_subbnd` — one greater than the highest active sub-band
+    /// (§E.2.3.3.17).
+    pub end_subbnd: usize,
+    /// Resolved `ecplbndstrc[]`, indexed by absolute sub-band number: a
+    /// `true` entry merges that sub-band into the previous band.
+    pub bndstrc: [bool; N_ECPL_SUBBND],
+    /// `necplbnd` — number of enhanced-coupling bands (§E.2.3.3.19).
+    pub necplbnd: usize,
+}
+
+impl EcplStrategy {
+    /// First transform-coefficient (bin) of the enhanced-coupling region.
+    #[inline]
+    pub fn begin_bin(&self) -> usize {
+        begin_bin(self.begin_subbnd)
+    }
+
+    /// One-past-the-last transform-coefficient (bin) of the region.
+    #[inline]
+    pub fn end_bin(&self) -> usize {
+        end_bin(self.end_subbnd)
+    }
+
+    /// Per-band bin counts (`nbins_per_bnd_array[]`, §E.3.5.5.1).
+    #[inline]
+    pub fn band_bin_counts(&self) -> Vec<usize> {
+        band_bin_counts(self.begin_subbnd, self.end_subbnd, &self.bndstrc)
+    }
+}
+
+/// Parse the enhanced-coupling **strategy** block (§E.2.3.3.16-19 / the
+/// `ecplinu` arm of Table E1.4, reached only when
+/// `cplstre[blk] && cplinu[blk] && ecplinu`).
+///
+/// Field order (each `read_u32` advances the cursor exactly as the
+/// reference syntax does):
+///
+/// 1. `ecplbegf` (4 bits) → `ecpl_begin_subbnd` via [`begin_subbnd`].
+/// 2. `ecplendf` (4 bits) **only when SPX is off**; when SPX is active
+///    `ecpl_end_subbnd` is derived from `spxbegf` and `ecplendf` is *not*
+///    transmitted ([`end_subbnd`]).
+/// 3. `ecplbndstrce` (1 bit). When set, the per-sub-band merge bits
+///    `ecplbndstrc[sbnd]` follow for
+///    `sbnd in [max(9, ecpl_begin_subbnd + 1), ecpl_end_subbnd)` — the
+///    sub-bands up to and including `max(8, ecpl_begin_subbnd)` are known
+///    to be `0` and are never sent (§E.2.3.3.19).
+///
+/// `ecplbndstrce == 0` means *use the default / reuse the previous*
+/// structure. The caller supplies `prev_bndstrc`: pass
+/// [`DEFAULT_ECPL_BNDSTRC`] on the first block of the frame that enables
+/// enhanced coupling, or the previously-decoded structure on a later
+/// block (§E.2.3.3.18). When `ecplbndstrce == 1` the supplied default is
+/// ignored and a fresh all-`false` base is populated from the wire bits.
+pub fn parse_strategy(
+    br: &mut BitReader<'_>,
+    spxinu: bool,
+    spxbegf: usize,
+    prev_bndstrc: &[bool; N_ECPL_SUBBND],
+) -> Result<EcplStrategy> {
+    let ecplbegf = br.read_u32(4)? as u8;
+    let begin = begin_subbnd(ecplbegf);
+    let ecplendf = if spxinu { 0 } else { br.read_u32(4)? as u8 };
+    let end = end_subbnd(spxinu, ecplendf, spxbegf);
+
+    let ecplbndstrce = br.read_u32(1)? != 0;
+    let bndstrc = if ecplbndstrce {
+        // Fresh structure from the wire. Sub-bands up to and including
+        // max(8, begin) are implicitly 0 and not transmitted; the loop
+        // starts at max(9, begin + 1). The merge bit for the very first
+        // active sub-band is therefore never sent — it always starts a
+        // band (§E.2.3.3.19).
+        let mut t = [false; N_ECPL_SUBBND];
+        let lo = (begin + 1).max(9);
+        for sbnd in lo..end.min(N_ECPL_SUBBND) {
+            t[sbnd] = br.read_u32(1)? != 0;
+        }
+        t
+    } else {
+        // Reuse the default (first block) or the previous block's
+        // structure (later block) — no bits consumed.
+        *prev_bndstrc
+    };
+
+    let necplbnd = necplbnd(begin, end, &bndstrc);
+    Ok(EcplStrategy {
+        begin_subbnd: begin,
+        end_subbnd: end,
+        bndstrc,
+        necplbnd,
+    })
+}
+
+/// Per-channel decoded enhanced-coupling **parameters** for a block
+/// (§E.2.3.3.21-26). Only channels in coupling carry an entry; the angle
+/// and chaos arrays of the *first* coupled channel are spec-fixed to `0`
+/// and not transmitted, so they stay empty on that channel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EcplChannelParams {
+    /// `ecplparam1e[ch]` — amplitudes present this block.
+    pub param1e: bool,
+    /// `ecplparam2e[ch]` — angle + chaos present this block.
+    pub param2e: bool,
+    /// `ecplamp[ch][bnd]` — 5-bit amplitude index per band (present iff
+    /// `param1e`).
+    pub amp: Vec<u8>,
+    /// `ecplangle[ch][bnd]` — 6-bit angle index per band (present iff
+    /// `param2e` and not the first coupled channel).
+    pub angle: Vec<u8>,
+    /// `ecplchaos[ch][bnd]` — 3-bit chaos index per band (present iff
+    /// `param2e` and not the first coupled channel).
+    pub chaos: Vec<u8>,
+    /// `ecpltrans[ch]` — transient-present flag (not transmitted for the
+    /// first coupled channel, where it is `false`).
+    pub trans: bool,
+}
+
+/// The decoded enhanced-coupling **coordinate** block for one audio block
+/// (§E.2.3.3.20-26 / the `ecplinu` arm of the coupling-coordinate loop in
+/// Table E1.4, reached when `cplinu[blk] && ecplinu`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EcplCoords {
+    /// `ecplangleintrp` — angle-interpolation flag (§E.2.3.3.20).
+    pub angleintrp: bool,
+    /// Per-front-channel parameters, indexed by channel number. Channels
+    /// not in coupling carry a default (all-`false`) entry.
+    pub channels: Vec<EcplChannelParams>,
+}
+
+/// Parse the enhanced-coupling **coordinate** block (§E.2.3.3.20-26).
+///
+/// `nfchans` is the number of full-bandwidth channels; `chincpl[ch]`
+/// flags which of them are in coupling. `firstcplcos[ch]` is the
+/// per-channel "first coupling block this frame" marker (the same one the
+/// standard-coupling `cplcoe` gate uses): on the first block a channel
+/// enters coupling, its `ecplparam1e`/`ecplparam2e` are *implicit* (not
+/// read from the wire) and all parameters are forced present — the spec
+/// guarantees every channel transmits its full parameter set the first
+/// time enhanced coupling is enabled. The marker is cleared in place so
+/// later blocks read the explicit exist bits.
+///
+/// `necplbnd` is the band count from the active [`EcplStrategy`]. The
+/// first coupled channel (`firstchincpl`) never carries `ecplparam2e`,
+/// `ecplangle`, `ecplchaos`, or `ecpltrans` — its angle/chaos are
+/// spec-fixed to `0` (§E.2.3.3.24-26).
+pub fn parse_coords(
+    br: &mut BitReader<'_>,
+    nfchans: usize,
+    chincpl: &[bool],
+    firstcplcos: &mut [bool],
+    necplbnd: usize,
+) -> Result<EcplCoords> {
+    let angleintrp = br.read_u32(1)? != 0;
+    let mut channels = vec![EcplChannelParams::default(); nfchans];
+
+    // firstchincpl = -1 → the first channel actually in coupling.
+    let mut firstchincpl: Option<usize> = None;
+
+    for ch in 0..nfchans {
+        if !chincpl[ch] {
+            // §E.2.3.3 "!chincpl[ch]" arm: re-arm the first-coupling
+            // marker so a later block re-entering coupling treats its
+            // parameters as implicit-present again.
+            firstcplcos[ch] = true;
+            continue;
+        }
+        let is_first = firstchincpl.is_none();
+        if is_first {
+            firstchincpl = Some(ch);
+        }
+
+        let (param1e, param2e) = if firstcplcos[ch] {
+            // First block this channel is in coupling: parameters are
+            // implicit. param1e is always 1; param2e is 1 only for
+            // channels after the first coupled channel.
+            firstcplcos[ch] = false;
+            (true, !is_first)
+        } else {
+            let p1 = br.read_u32(1)? != 0;
+            // param2e is transmitted only for channels after the first
+            // coupled channel; the first coupled channel's angle/chaos
+            // are fixed to 0, so it has no param2e bit.
+            let p2 = if !is_first {
+                br.read_u32(1)? != 0
+            } else {
+                false
+            };
+            (p1, p2)
+        };
+
+        let mut params = EcplChannelParams {
+            param1e,
+            param2e,
+            ..Default::default()
+        };
+
+        if param1e {
+            params.amp.reserve_exact(necplbnd);
+            for _ in 0..necplbnd {
+                params.amp.push(br.read_u32(5)? as u8);
+            }
+        }
+        if param2e {
+            params.angle.reserve_exact(necplbnd);
+            params.chaos.reserve_exact(necplbnd);
+            for _ in 0..necplbnd {
+                params.angle.push(br.read_u32(6)? as u8);
+                params.chaos.push(br.read_u32(3)? as u8);
+            }
+        }
+        // ecpltrans[ch] is transmitted only for channels after the first
+        // coupled channel.
+        if !is_first {
+            params.trans = br.read_u32(1)? != 0;
+        }
+
+        channels[ch] = params;
+    }
+
+    Ok(EcplCoords {
+        angleintrp,
+        channels,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxideav_core::bits::{BitReader, BitWriter};
 
     #[test]
     fn ecplsubbndtab_matches_table_e3_9() {
@@ -329,5 +584,207 @@ mod tests {
         let n = necplbnd(begin, end, &DEFAULT_ECPL_BNDSTRC);
         let counts = band_bin_counts(begin, end, &DEFAULT_ECPL_BNDSTRC);
         assert_eq!(counts.len(), n);
+    }
+
+    // ---- §E.2.3.3.16-19 strategy parse ----
+
+    #[test]
+    fn parse_strategy_no_spx_default_banding() {
+        // ecplbegf = 7 → begin = 9; SPX off, ecplendf = 15 → end = 22;
+        // ecplbndstrce = 0 → reuse the supplied default banding (no merge
+        // bits on the wire).
+        let mut w = BitWriter::new();
+        w.write_u32(7, 4); // ecplbegf
+        w.write_u32(15, 4); // ecplendf
+        w.write_u32(0, 1); // ecplbndstrce = 0
+        let bytes = w.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let strat = parse_strategy(&mut br, false, 0, &DEFAULT_ECPL_BNDSTRC).unwrap();
+        assert_eq!(strat.begin_subbnd, 9);
+        assert_eq!(strat.end_subbnd, 22);
+        assert_eq!(strat.bndstrc, DEFAULT_ECPL_BNDSTRC);
+        // begin=9, end=22, default banding → 4 bands (see geometry test).
+        assert_eq!(strat.necplbnd, 4);
+        assert_eq!(strat.begin_bin(), 97);
+        assert_eq!(strat.end_bin(), 253);
+        // Exactly 9 bits consumed (4 + 4 + 1).
+        assert_eq!(br.bit_position(), 9);
+    }
+
+    #[test]
+    fn parse_strategy_spx_active_skips_ecplendf() {
+        // SPX on, spxbegf = 5 → end = spxbegf + 5 = 10; ecplendf is NOT
+        // transmitted. ecplbegf = 5 → begin = 7. ecplbndstrce = 0.
+        let mut w = BitWriter::new();
+        w.write_u32(5, 4); // ecplbegf
+        w.write_u32(0, 1); // ecplbndstrce = 0 (no ecplendf field)
+        let bytes = w.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let strat = parse_strategy(&mut br, true, 5, &DEFAULT_ECPL_BNDSTRC).unwrap();
+        assert_eq!(strat.begin_subbnd, 7);
+        assert_eq!(strat.end_subbnd, 10);
+        // Only 5 bits consumed because ecplendf is omitted under SPX.
+        assert_eq!(br.bit_position(), 5);
+    }
+
+    #[test]
+    fn parse_strategy_explicit_banding_bits() {
+        // ecplbegf = 7 → begin = 9; ecplendf = 15 → end = 22.
+        // ecplbndstrce = 1 → merge bits for sbnd in [max(9,10), 22) =
+        // [10, 22): that's 12 bits. Set every other bit so we can verify
+        // placement: 10=1, 11=0, 12=1, ... merge bits transmitted from
+        // sbnd 10 upward. The first active sub-band (9) is never a merge
+        // bit (not transmitted) and stays false.
+        let mut w = BitWriter::new();
+        w.write_u32(7, 4); // ecplbegf
+        w.write_u32(15, 4); // ecplendf
+        w.write_u32(1, 1); // ecplbndstrce = 1
+        let pattern = [
+            true, false, true, false, true, false, true, false, true, false, true, false,
+        ];
+        for &b in &pattern {
+            w.write_u32(b as u32, 1);
+        }
+        let bytes = w.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let strat = parse_strategy(&mut br, false, 0, &DEFAULT_ECPL_BNDSTRC).unwrap();
+        // Sub-band 9 is never transmitted → false.
+        assert!(!strat.bndstrc[9]);
+        // Sub-bands 10..22 match the pattern.
+        for (i, &b) in pattern.iter().enumerate() {
+            assert_eq!(strat.bndstrc[10 + i], b, "sbnd {}", 10 + i);
+        }
+        // 6 merges in the pattern → 13 sub-bands − 6 = 7 bands.
+        assert_eq!(strat.necplbnd, 13 - 6);
+        // 4 + 4 + 1 + 12 = 21 bits.
+        assert_eq!(br.bit_position(), 21);
+    }
+
+    // ---- §E.2.3.3.20-26 coordinate parse ----
+
+    #[test]
+    fn parse_coords_first_block_implicit_present() {
+        // 2/0: both channels in coupling, both firstcplcos (first block).
+        // necplbnd = 2 for a compact test. ch0 = first coupled channel:
+        // param1e implicit 1 (amps follow), param2e = 0 (angle/chaos fixed
+        // to 0, not sent), no ecpltrans. ch1: param1e + param2e implicit
+        // 1, then ecpltrans (1 bit).
+        let necplbnd = 2usize;
+        let mut w = BitWriter::new();
+        w.write_u32(1, 1); // ecplangleintrp = 1
+                           // ch0: implicit param1e=1 → 2 amps (5 bits each).
+        w.write_u32(3, 5);
+        w.write_u32(7, 5);
+        // ch1: implicit param1e=1 → 2 amps; implicit param2e=1 → 2×(angle
+        // 6 + chaos 3); ecpltrans = 1.
+        w.write_u32(11, 5);
+        w.write_u32(15, 5);
+        w.write_u32(20, 6);
+        w.write_u32(4, 3);
+        w.write_u32(33, 6);
+        w.write_u32(2, 3);
+        w.write_u32(1, 1); // ecpltrans[1]
+        let bytes = w.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let chincpl = [true, true];
+        let mut firstcplcos = [true, true];
+        let c = parse_coords(&mut br, 2, &chincpl, &mut firstcplcos, necplbnd).unwrap();
+        assert!(c.angleintrp);
+        // firstcplcos cleared for both.
+        assert_eq!(firstcplcos, [false, false]);
+
+        // ch0 (first coupled): param1e, no param2e, no trans.
+        assert!(c.channels[0].param1e);
+        assert!(!c.channels[0].param2e);
+        assert_eq!(c.channels[0].amp, vec![3, 7]);
+        assert!(c.channels[0].angle.is_empty());
+        assert!(c.channels[0].chaos.is_empty());
+        assert!(!c.channels[0].trans);
+
+        // ch1: param1e + param2e + trans.
+        assert!(c.channels[1].param1e);
+        assert!(c.channels[1].param2e);
+        assert_eq!(c.channels[1].amp, vec![11, 15]);
+        assert_eq!(c.channels[1].angle, vec![20, 33]);
+        assert_eq!(c.channels[1].chaos, vec![4, 2]);
+        assert!(c.channels[1].trans);
+
+        // 1 + (2×5) + (2×5 + 2×(6+3) + 1) = 1 + 10 + 29 = 40 bits.
+        assert_eq!(br.bit_position(), 40);
+    }
+
+    #[test]
+    fn parse_coords_later_block_explicit_exist_bits() {
+        // Later block (firstcplcos already cleared): exist bits are read
+        // from the wire. ch0 first coupled: param1e bit only (no param2e,
+        // no trans). ch1: param1e + param2e bits + trans.
+        let necplbnd = 1usize;
+        let mut w = BitWriter::new();
+        w.write_u32(0, 1); // ecplangleintrp = 0
+                           // ch0: param1e = 1 → 1 amp.
+        w.write_u32(1, 1); // param1e
+        w.write_u32(9, 5); // amp
+                           // ch1: param1e = 0 (reuse), param2e = 1 → angle+chaos; trans = 0.
+        w.write_u32(0, 1); // param1e
+        w.write_u32(1, 1); // param2e
+        w.write_u32(42, 6); // angle
+        w.write_u32(5, 3); // chaos
+        w.write_u32(0, 1); // ecpltrans[1]
+        let bytes = w.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let chincpl = [true, true];
+        let mut firstcplcos = [false, false];
+        let c = parse_coords(&mut br, 2, &chincpl, &mut firstcplcos, necplbnd).unwrap();
+        assert!(!c.angleintrp);
+        assert!(c.channels[0].param1e);
+        assert!(!c.channels[0].param2e);
+        assert_eq!(c.channels[0].amp, vec![9]);
+        assert!(!c.channels[1].param1e);
+        assert!(c.channels[1].param2e);
+        assert!(c.channels[1].amp.is_empty());
+        assert_eq!(c.channels[1].angle, vec![42]);
+        assert_eq!(c.channels[1].chaos, vec![5]);
+        assert!(!c.channels[1].trans);
+        // 1 + (1 + 5) + (1 + 1 + 6 + 3 + 1) = 1 + 6 + 12 = 19 bits.
+        assert_eq!(br.bit_position(), 19);
+    }
+
+    #[test]
+    fn parse_coords_channel_not_in_coupling_rearms_marker() {
+        // 3/0: ch1 not in coupling. firstcplcos[1] must be re-armed to
+        // true; its params stay default. ch0 + ch2 are coupled.
+        let necplbnd = 1usize;
+        let mut w = BitWriter::new();
+        w.write_u32(0, 1); // ecplangleintrp
+                           // ch0 (first coupled, first block): implicit param1e → 1 amp.
+        w.write_u32(8, 5);
+        // ch1 skipped (not in coupling).
+        // ch2 (second coupled, first block): implicit param1e + param2e +
+        // trans.
+        w.write_u32(12, 5); // amp
+        w.write_u32(30, 6); // angle
+        w.write_u32(6, 3); // chaos
+        w.write_u32(0, 1); // trans
+        let bytes = w.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let chincpl = [true, false, true];
+        let mut firstcplcos = [true, true, true];
+        let c = parse_coords(&mut br, 3, &chincpl, &mut firstcplcos, necplbnd).unwrap();
+        // ch1 re-armed, ch0 + ch2 cleared.
+        assert_eq!(firstcplcos, [false, true, false]);
+        assert_eq!(c.channels[0].amp, vec![8]);
+        assert_eq!(c.channels[1], EcplChannelParams::default());
+        assert_eq!(c.channels[2].amp, vec![12]);
+        assert_eq!(c.channels[2].angle, vec![30]);
+        // ch2 is the *second* coupled channel → carries param2e + trans.
+        assert!(c.channels[2].param2e);
+        // 1 + 5 + (5 + 6 + 3 + 1) = 21 bits.
+        assert_eq!(br.bit_position(), 21);
     }
 }
