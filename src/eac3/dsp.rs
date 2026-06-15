@@ -95,7 +95,7 @@
 //! prev/curr/next blocks and emits each coupled channel's coefficients
 //! via [`super::ecpl::synthesize_block`] before the §7.4 decouple is
 //! skipped. None of the validator-encoded corpus fixtures exercise the
-//! ecpl path (ffmpeg's eac3 encoder emits only standard coupling), so
+//! ecpl path (the corpus encoder emits only standard coupling), so
 //! the synthesis is covered by [`super::ecpl`] unit tests; standard
 //! coupling covers all four 5.1 / low-rate fixtures
 //! (eac3-5.1-48000-384kbps, eac3-5.1-side-768kbps,
