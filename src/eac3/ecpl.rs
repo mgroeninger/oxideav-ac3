@@ -1124,10 +1124,19 @@ pub const ECPL_MAX_FBW: usize = 5;
 /// * `trans_lfsr` — the transient random generator state; the transient
 ///   values "must be new for each block", so this LFSR threads across
 ///   blocks/frames advancing the sequence.
+/// * `prev_frame_last_mant` — the de-normalised enhanced-coupling mantissa
+///   buffer of the *last* block of the immediately preceding frame, when
+///   that block used enhanced coupling. The §E.3.5.5.1 carrier of block 0
+///   needs its "previous block" spectrum; block numbering is continuous
+///   across the stream, so the previous frame's final enhanced-coupling
+///   block is that neighbour. The spec's "set to zero" rule fires only
+///   when enhanced coupling was *not* in use in that previous block, which
+///   `None` represents (no carried spectrum → zero `prev`).
 #[derive(Clone, Debug, Default)]
 pub struct EcplState {
     rand_notrans: [Option<RandNoTrans>; ECPL_MAX_FBW],
     trans_lfsr: u32,
+    prev_frame_last_mant: Option<[f32; 256]>,
 }
 
 impl EcplState {
@@ -1137,7 +1146,24 @@ impl EcplState {
             rand_notrans: Default::default(),
             // Non-zero seed required for the xorshift transient generator.
             trans_lfsr: 0x2545_F491,
+            prev_frame_last_mant: None,
         }
+    }
+
+    /// The carried-over enhanced-coupling mantissa buffer of the previous
+    /// frame's last block, or `None` when that block did not use enhanced
+    /// coupling (the §E.3.5.5.1 "set to zero" boundary case for block 0's
+    /// `previous block`).
+    pub fn prev_frame_last_mant(&self) -> Option<&[f32; 256]> {
+        self.prev_frame_last_mant.as_ref()
+    }
+
+    /// Record this frame's final enhanced-coupling mantissa buffer so the
+    /// next frame's block 0 carrier can consult it as its "previous block"
+    /// (§E.3.5.5.1). Pass `None` when the frame's last block did not use
+    /// enhanced coupling, which resets the carry to the zero boundary case.
+    pub fn set_prev_frame_last_mant(&mut self, mant: Option<[f32; 256]>) {
+        self.prev_frame_last_mant = mant;
     }
 
     /// The cached non-transient random array for channel `ch`, building it
@@ -2147,5 +2173,79 @@ mod tests {
         let ch1_first = st.rand_notrans(1, 512).get(0);
         let ch2_first = st.rand_notrans(2, 512).get(0);
         assert!(ch1_first != ch2_first, "channels share a random sequence");
+    }
+
+    #[test]
+    fn ecpl_state_prev_frame_mant_roundtrips() {
+        // §E.3.5.5.1 cross-frame carry: a fresh state has no carried
+        // previous-frame spectrum (block 0's "previous block" defaults to
+        // the zero boundary case); set/get round-trips, and a `None` reset
+        // restores the boundary case.
+        let mut st = EcplState::new();
+        assert!(
+            st.prev_frame_last_mant().is_none(),
+            "fresh state must carry no previous-frame spectrum"
+        );
+        let carried: [f32; 256] = std::array::from_fn(|i| (i as f32) * 0.5);
+        st.set_prev_frame_last_mant(Some(carried));
+        assert_eq!(
+            st.prev_frame_last_mant().copied(),
+            Some(carried),
+            "carried spectrum must round-trip"
+        );
+        st.set_prev_frame_last_mant(None);
+        assert!(
+            st.prev_frame_last_mant().is_none(),
+            "None reset must restore the zero boundary case"
+        );
+    }
+
+    #[test]
+    fn synthesize_block_consults_prev_neighbour() {
+        // The §E.3.5.5.1 carrier of the current block depends on the
+        // *previous* block's spectrum (it suppresses time-domain aliasing).
+        // A non-zero `prev` (as the cross-frame carry supplies for block 0)
+        // must therefore change the synthesised output versus a zero `prev`
+        // — proving the previous-frame edge is actually threaded through.
+        let curr = sample_block(2);
+        let mut zero_prev = curr.clone();
+        zero_prev.mant = [0.0; 256];
+        let mut nonzero_prev = curr.clone();
+        nonzero_prev.mant = std::array::from_fn(|i| sample_block(2).mant[i] * 0.75);
+
+        let mut st_zero = EcplState::new();
+        let mut st_carry = EcplState::new();
+        let mut out_zero = vec![[0.0f32; 256]; ECPL_MAX_FBW];
+        let mut out_carry = vec![[0.0f32; 256]; ECPL_MAX_FBW];
+        // next = zero in both (the last-block boundary case) isolates the
+        // contribution of the previous-block spectrum.
+        let zero_next = zero_prev.clone();
+        synthesize_block(
+            &mut st_zero,
+            &zero_prev,
+            &curr,
+            &zero_next,
+            &mut out_zero,
+            512,
+        );
+        synthesize_block(
+            &mut st_carry,
+            &nonzero_prev,
+            &curr,
+            &zero_next,
+            &mut out_carry,
+            512,
+        );
+
+        let mut diff = 0.0f32;
+        for ch in 0..2 {
+            for bin in begin_bin(0)..end_bin(2) {
+                diff += (out_zero[ch][bin] - out_carry[ch][bin]).abs();
+            }
+        }
+        assert!(
+            diff > 1e-3,
+            "non-zero previous-block spectrum did not affect synthesis (diff={diff})"
+        );
     }
 }

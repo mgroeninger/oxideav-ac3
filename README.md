@@ -77,9 +77,12 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   previous / current / next blocks (§E.3.5.5.1), processes the per-bin
   amplitudes + de-correlated angles, and emits each coupled channel's
   transform coefficients via the §E.3.5.5.4 complex product — replacing
-  the standard §7.4 decouple. Frame-edge neighbours use zero carriers
-  (the §E.3.5.5.1 "set to zero" rule); threading the adjacent frames'
-  edge coefficients across the two boundary blocks is a follow-up. The
+  the standard §7.4 decouple. Block 0's "previous block" carrier source
+  is threaded across the frame boundary from the prior frame's last
+  enhanced-coupling block (carried on `EcplState`, §E.3.5.5.1), so the
+  prior-frame edge no longer collapses to a zero carrier; the frame's
+  last block's "next block" still uses a zero carrier (it lives in a
+  not-yet-decoded frame — streaming lookahead is out of scope). The
   §E.3.3.2 `nrematbd` derivation now folds in enhanced coupling: a 2/0
   `ecplinu` block sizes its rematrix-flag field from the raw `ecplbegf`
   code (0/1/2/<5 → 0/1/2/3 bands, else 4) rather than `cplbegf`, keeping
