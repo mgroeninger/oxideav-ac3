@@ -67,11 +67,13 @@
 //!   amplitudes + de-correlated angles, and emits each coupled channel's
 //!   transform coefficients via the §E.3.5.5.4 complex product. The
 //!   per-step primitives + the [`ecpl::synthesize_block`] orchestration
-//!   are spec-derived and unit-tested in [`ecpl`]. Frame-edge neighbours
-//!   use zero carriers (the §E.3.5.5.1 "set to zero" rule); threading
-//!   the adjacent frames' edge coefficients across the two boundary
-//!   blocks, and the 2/0 ecpl + rematrix band-count interaction, are
-//!   follow-ups. Standard coupling is fully in.
+//!   are spec-derived and unit-tested in [`ecpl`]. Block 0's "previous
+//!   block" carrier source is now threaded from the prior frame's last
+//!   enhanced-coupling block (carried on [`ecpl::EcplState`], §E.3.5.5.1);
+//!   the prior-frame edge no longer collapses to a zero carrier. The
+//!   frame's last block's "next block" still uses a zero carrier (it lives
+//!   in a not-yet-decoded frame — streaming lookahead is out of scope).
+//!   Standard coupling is fully in.
 //! * **Cross-frame transient pre-noise reference** (§E.3.7.1) is
 //!   clamped to the current frame; intra-frame transients (§E.3.7.2)
 //!   are fully synthesised.

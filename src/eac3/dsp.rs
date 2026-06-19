@@ -1452,10 +1452,15 @@ pub fn decode_indep_audblks(
 /// 3. `dsp_block` runs the remaining stages (rematrix / SPX / dynrng /
 ///    IMDCT / overlap-add) and the PCM is emitted to `out`.
 ///
-/// Cross-frame neighbours (the block before block 0 and after the last
-/// block) are treated as zero here; threading the adjacent frames' edge
-/// coefficients is a documented follow-up (the §E.3.5.5.1 edge rule only
-/// affects the two boundary blocks of each frame).
+/// The "previous block" of frame block 0 is the *last* block of the prior
+/// frame (block numbering is continuous across the stream). When that block
+/// used enhanced coupling its de-normalised mantissa buffer is carried over
+/// on [`super::ecpl::EcplState`] and used as block 0's `prev`; otherwise the
+/// §E.3.5.5.1 "set to zero" rule applies and a zero buffer is used. This
+/// frame's final enhanced-coupling block is in turn recorded for the next
+/// frame. The "next block" of the frame's last block lives in a frame not
+/// yet decoded, so it remains zero (true streaming lookahead is out of
+/// scope).
 #[allow(clippy::too_many_arguments)]
 fn run_deferred_ecpl_dsp(
     state: &mut Ac3State,
@@ -1485,6 +1490,17 @@ fn run_deferred_ecpl_dsp(
         chincpl: [false; super::ecpl::ECPL_MAX_FBW],
     };
 
+    // Cross-frame "previous block" for frame block 0: the prior frame's last
+    // enhanced-coupling block, carried over on `EcplState`. Only its mantissa
+    // buffer is consulted by the carrier (strategy/coords/chincpl come from
+    // `curr`), so wrap the carried spectrum in an otherwise-zero block. When
+    // the prior frame had no trailing enhanced coupling this stays the zero
+    // block (the §E.3.5.5.1 boundary case).
+    let mut prev_frame_block = zero_block.clone();
+    if let Some(carried) = state.ecpl_state.prev_frame_last_mant() {
+        prev_frame_block.mant = *carried;
+    }
+
     for i in 0..n_deferred {
         // Snapshot index `i` maps to absolute block `abs_blk`.
         let abs_blk = first_deferred_blk + i;
@@ -1510,7 +1526,9 @@ fn run_deferred_ecpl_dsp(
                 let prev = if abs_blk > 0 {
                     ecpl_blocks[abs_blk - 1].as_ref().unwrap_or(&zero_block)
                 } else {
-                    &zero_block
+                    // Frame block 0 — its "previous block" is the prior
+                    // frame's last enhanced-coupling block (§E.3.5.5.1).
+                    &prev_frame_block
                 };
                 let next = if abs_blk + 1 < ecpl_blocks.len() {
                     ecpl_blocks[abs_blk + 1].as_ref().unwrap_or(&zero_block)
@@ -1556,6 +1574,13 @@ fn run_deferred_ecpl_dsp(
             }
         }
     }
+
+    // Carry this frame's last block's enhanced-coupling spectrum to the next
+    // frame so its block 0 carrier can use it as the "previous block"
+    // (§E.3.5.5.1). When the final frame block did not use enhanced coupling
+    // the carry resets to `None` (the spec's "set to zero" boundary case).
+    let last_mant = ecpl_blocks.last().and_then(|b| b.as_ref()).map(|b| b.mant);
+    state.ecpl_state.set_prev_frame_last_mant(last_mant);
 }
 
 /// Transient pre-noise time-scaling synthesis for one full-bandwidth
