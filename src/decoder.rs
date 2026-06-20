@@ -886,8 +886,9 @@ mod tests {
 
     // -- DRC control surface (§6.1.9 / §7.6 / §7.7) end-to-end tests --
 
-    /// Decode the FFmpeg `sine440_stereo.ac3` fixture and return the RMS
-    /// of the interleaved S16 output PCM under the supplied DRC settings.
+    /// Decode the in-tree `sine440_stereo.ac3` validator fixture and
+    /// return the RMS of the interleaved S16 output PCM under the supplied
+    /// DRC settings.
     fn decode_fixture_rms(drc: DrcSettings) -> f64 {
         use oxideav_core::Packet;
         use oxideav_core::TimeBase as TB;
@@ -923,13 +924,12 @@ mod tests {
         (sum_sq / n as f64).sqrt()
     }
 
-    /// §7.6 dialogue normalisation: configuring a quieter (larger-headroom)
-    /// dialnorm target than the stream's authored dialnorm attenuates the
-    /// output by exactly `10^((target − dialnorm)/20)`. The fixture is
-    /// FFmpeg-encoded with the default dialnorm = 31; targeting 15
-    /// (a smaller headroom = louder) boosts; targeting a value below 31
-    /// is impossible (31 is the max), so we boost toward 15 and confirm
-    /// the ratio matches the closed-form gain within quantisation noise.
+    /// §7.6 dialogue normalisation: configuring a different dialnorm
+    /// target than the stream's authored dialnorm scales the output by
+    /// exactly `10^((target − dialnorm)/20)`. The validator fixture
+    /// carries the default dialnorm = 31; targeting 15 (a smaller
+    /// headroom = louder) boosts, and we confirm the ratio matches the
+    /// closed-form gain within quantisation noise.
     #[test]
     fn dialnorm_target_scales_output_by_closed_form_gain() {
         let baseline = decode_fixture_rms(DrcSettings::line_out());
@@ -937,8 +937,8 @@ mod tests {
             eprintln!("fixture decoded to near-silence — skipping dialnorm test");
             return;
         }
-        // Stream dialnorm is 31 (FFmpeg default). Target 15 → gain
-        // 10^((15 − 31)/20) = 10^(-0.8) ≈ 0.1585 (attenuation).
+        // The fixture's authored dialnorm is the default 31. Target 15 →
+        // gain 10^((15 − 31)/20) = 10^(-0.8) ≈ 0.1585 (attenuation).
         let target = 15u8;
         let dialnorm = 31u8;
         let expected = 10f64.powf((target as f64 - dialnorm as f64) / 20.0);
